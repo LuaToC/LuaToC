@@ -1,5 +1,5 @@
 # LuaToC
-Made by macsipac, a Lua to C transpiler
+Made by macsipac, a Lua to C transpiler.
 How to use:
 1. If you did not already, install lua (luajit works best!)
 2. Download the transpiler.lua file
