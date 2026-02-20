@@ -1,6 +1,6 @@
--- compile.lua  v7
+-- transpiler.lua  v7
 -- Lua -> C AOT transpiler
--- Usage: lua compile.lua input.lua  =>  output.c
+-- Usage: lua transpiler.lua input.lua  =>  output.c
 
 local input_path  = arg[1] or "input.lua"
 local output_path = "output.c"
@@ -953,3 +953,4 @@ local f=assert(io.open(output_path,"w"))
 f:write(table.concat(out,"\n"))
 f:close()
 print("Wrote "..output_path)
+
