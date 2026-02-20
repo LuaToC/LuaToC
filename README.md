@@ -1,5 +1,6 @@
 # LuaToC
 Made by macsipac, a Lua to C transpiler.  
+Please report all issues in well, the github issues tab!  
 (this is a re-implementation of lua! not all lua code is guaranteed to work with this)  
 How to use:  
 1. If you did not already, install lua (luajit works best!)  
