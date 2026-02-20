@@ -9,4 +9,4 @@ How to use:
 4. Run lua transpiler.lua [your .lua script path, by default ./input.lua]  
 5. Output.c will be generated, if nothing went wrong it should be able to be compiled!  
 Heres a MinGW64 command to compile output.c with max optimization:  
-gcc -O3 -march=native -flto -o output output.c)  
+gcc -O3 -march=native -flto -o output output.c  
