@@ -1,4 +1,5 @@
 -- transpiler.lua  v7
+-- made by macsipac, Apache 2.0 liscence
 -- Lua -> C AOT transpiler
 -- Usage: lua transpiler.lua input.lua  =>  output.c
 
@@ -953,4 +954,5 @@ local f=assert(io.open(output_path,"w"))
 f:write(table.concat(out,"\n"))
 f:close()
 print("Wrote "..output_path)
+
 
