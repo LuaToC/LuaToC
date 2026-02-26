@@ -1,21 +1,37 @@
--- transpiler.lua  v7
--- made by macsipac, Apache 2.0 liscence
+-- transpiler.lua  v15
+-- made by macsipac, Apache 2.0 licence
 -- Lua -> C AOT transpiler
 -- Usage: lua transpiler.lua input.lua  =>  output.c
+-- v15 fixes:
+--   * FIX-D1: RetFrame system replaced with Option-A retslot_save/restore.
+--              value_call/table_call/value_method_call are now fully self-contained:
+--              they save+restore caller's retbuf around the callee, then merge the
+--              callee's secondary returns back into __retbuf for the caller to read.
+--              No RETFRAME_PUSH/POP needed at any call site. Eliminates bugs 1-4:
+--              frame leak on every call, wrong frame index (+1 OOB), premature free
+--              of secondaries, and missing pops in expression context.
+--   * FIX-D2: table_get now guards NaN keys (returns nil, consistent with Lua).
+--              table_raw_set already errored on NaN; get silently misprobed before.
+--   * FIX-D3: Removed all is_call_expr guards on RETFRAME_POP from gen_stmt;
+--              call sites emit no push/pop at all now.
 
 local input_path  = arg[1] or "input.lua"
 local output_path = "output.c"
 
+-- ---------------------------------------------------------------------------
+-- Tiny utilities
+-- ---------------------------------------------------------------------------
 local function trim(s) return (s or ""):match("^%s*(.-)%s*$") end
 local LONG_STR_NL = "\1"
 
 local function escape_c(s)
-    return s:gsub("\\","\\\\"):gsub('"','\\"'):gsub("\1","\\n"):gsub("\n","\\n"):gsub("\r","\\r")
+    return s:gsub("\\","\\\\"):gsub('"','\\"')
+             :gsub("\1","\\n"):gsub("\n","\\n"):gsub("\r","\\r")
 end
 local function lua_str_inner(expr)
-    local d,inner=expr:sub(1,1),expr:sub(2,-2)
-    inner=inner:gsub("\1","\\n")
-    if d=="'" then inner=inner:gsub("\\'","'"):gsub('"','\\"') end
+    local d, inner = expr:sub(1,1), expr:sub(2,-2)
+    inner = inner:gsub("\1","\\n")
+    if d == "'" then inner = inner:gsub("\\'","'"):gsub('"','\\"') end
     return inner
 end
 local function is_int(s)  return s:match("^%-?%d+$") end
@@ -23,40 +39,43 @@ local function is_flt(s)  return s:match("^%-?%d+%.%d+$") end
 local function is_str(s)  return s:match('^".*"$') or s:match("^'.*'$") or s:match("^%[%[.-%]%]$") end
 local function is_id(s)   return s:match("^[A-Za-z_][A-Za-z0-9_]*$") end
 
-local function skip_str(e,i)
-    local q=e:sub(i,i); i=i+1
-    while i<=#e do
-        local c=e:sub(i,i)
-        if c=='\\' then i=i+2 elseif c==q then return i+1 else i=i+1 end
+local function skip_str(e, i)
+    local q = e:sub(i,i); i = i+1
+    while i <= #e do
+        local c = e:sub(i,i)
+        if c == '\\' then i = i+2 elseif c == q then return i+1 else i = i+1 end
     end
     return i
 end
 
--- scan expr tracking depth; call cb(i,ch) at depth==0, returns early if cb returns a value
-local function depth_scan(e,cb)
-    local d,i=0,1
-    while i<=#e do
-        local ch=e:sub(i,i)
-        if ch=='"' or ch=="'" then i=skip_str(e,i)
-        elseif ch=='('or ch=='['or ch=='{' then d=d+1;i=i+1
-        elseif ch==')'or ch==']'or ch=='}' then d=d-1;i=i+1
+local function depth_scan(e, cb)
+    local d, i = 0, 1
+    while i <= #e do
+        local ch = e:sub(i,i)
+        if ch == '"' or ch == "'" then i = skip_str(e,i)
+        elseif ch=='(' or ch=='[' or ch=='{' then d=d+1; i=i+1
+        elseif ch==')' or ch==']' or ch=='}' then d=d-1; i=i+1
         else
-            if d==0 then local r1,r2=cb(i,ch); if r1 then return r1,r2 end end
-            i=i+1
+            if d == 0 then local r1,r2 = cb(i,ch); if r1 then return r1,r2 end end
+            i = i+1
         end
     end
 end
 
-local function find_op(expr,ops)
-    local len=#expr
-    return depth_scan(expr,function(i,_)
+local function find_op(expr, ops)
+    local len = #expr
+    return depth_scan(expr, function(i)
         for _,op in ipairs(ops) do
-            local ol=#op
-            if i+ol-1<=len and expr:sub(i,i+ol-1)==op then
-                local bef=expr:sub(math.max(1,i-1),i-1)
-                local aft=expr:sub(i+ol,math.min(len,i+ol))
+            local ol = #op
+            if i+ol-1 <= len and expr:sub(i,i+ol-1) == op then
                 if op:match("%a") then
-                    if(bef==""or bef:match("%W"))and(aft==""or aft:match("%W"))then return i,op end
+                    local ls = op:find("%S") or 1
+                    local le = op:find("%s*$") - 1
+                    local kw_start = i + ls - 1
+                    local kw_end   = i + le - 1
+                    local bef = expr:sub(kw_start-1, kw_start-1)
+                    local aft = expr:sub(kw_end+1,   kw_end+1)
+                    if (bef=="" or bef:match("%W")) and (aft=="" or aft:match("%W")) then return i,op end
                 else return i,op end
             end
         end
@@ -64,615 +83,1257 @@ local function find_op(expr,ops)
 end
 
 local function split_args(s)
-    local args,cur={},""
-    local d,i=0,1
-    while i<=#s do
-        local ch=s:sub(i,i)
-        if ch=='"'or ch=="'" then
-            local j=skip_str(s,i); cur=cur..s:sub(i,j-1); i=j
-        elseif ch=='('or ch=='['or ch=='{' then d=d+1;cur=cur..ch;i=i+1
-        elseif ch==')'or ch==']'or ch=='}' then d=d-1;cur=cur..ch;i=i+1
-        elseif ch==','and d==0 then table.insert(args,trim(cur));cur="";i=i+1
-        else cur=cur..ch;i=i+1 end
+    local args, cur, d = {}, "", 0
+    local i = 1
+    while i <= #s do
+        local ch = s:sub(i,i)
+        if ch=='"' or ch=="'" then
+            local j = skip_str(s,i); cur = cur..s:sub(i,j-1); i = j
+        elseif ch=='(' or ch=='[' or ch=='{' then d=d+1; cur=cur..ch; i=i+1
+        elseif ch==')' or ch==']' or ch=='}' then d=d-1; cur=cur..ch; i=i+1
+        elseif ch==',' and d==0 then table.insert(args, trim(cur)); cur=""; i=i+1
+        else cur=cur..ch; i=i+1 end
     end
-    if trim(cur)~="" then table.insert(args,trim(cur)) end
+    if trim(cur) ~= "" then table.insert(args, trim(cur)) end
     return args
 end
 
--- scan right-to-left at depth 0 for last occurrence of chars
-local function last_op_scan(expr,chars)
-    local last_i,last_op
-    local d,i=0,1
-    while i<=#expr do
-        local ch=expr:sub(i,i)
-        if ch=='"'or ch=="'" then i=skip_str(expr,i)
-        elseif ch=='('or ch=='['or ch=='{' then d=d+1;i=i+1
-        elseif ch==')'or ch==']'or ch=='}' then d=d-1;i=i+1
-        elseif d==0 then
-            if chars[ch] then last_i=i;last_op=ch end
-            i=i+1
+local function last_additive(expr)
+    local last_i, last_op, d = nil, nil, 0
+    local i = 1
+    while i <= #expr do
+        local ch = expr:sub(i,i)
+        if ch=='"' or ch=="'" then i=skip_str(expr,i)
+        elseif ch=='(' or ch=='[' or ch=='{' then d=d+1; i=i+1
+        elseif ch==')' or ch==']' or ch=='}' then d=d-1; i=i+1
+        elseif d==0 and (ch=='+' or ch=='-') and trim(expr:sub(1,i-1)) ~= "" then
+            last_i=i; last_op=ch; i=i+1
         else i=i+1 end
     end
-    return last_i,last_op
+    return last_i, last_op
 end
 
+local function last_muldiv(expr)
+    local last_i, last_op, d = nil, nil, 0
+    local i = 1
+    while i <= #expr do
+        local ch = expr:sub(i,i)
+        if ch=='"' or ch=="'" then i=skip_str(expr,i)
+        elseif ch=='(' or ch=='[' or ch=='{' then d=d+1; i=i+1
+        elseif ch==')' or ch==']' or ch=='}' then d=d-1; i=i+1
+        elseif d==0 and (ch=='*' or ch=='/' or ch=='%') then
+            last_i=i; last_op=ch; i=i+1
+        else i=i+1 end
+    end
+    return last_i, last_op
+end
+
+-- ---------------------------------------------------------------------------
+-- Temp var counter + array-call builder
+-- ---------------------------------------------------------------------------
+local tmp_counter = 0
+local function newtmp() tmp_counter=tmp_counter+1; return "__tmp"..tmp_counter end
+
+local function build_array_call(fn_name, args_t)
+    local n = #args_t
+    if n == 0 then return "", ("%s(0,NULL)"):format(fn_name) end
+    local arr = newtmp()
+    local init = table.concat(args_t, ",")
+    return "", ("(__extension__({Value %s[%d]={%s};%s(%d,%s);}))"):format(arr,n,init,fn_name,n,arr)
+end
+
+-- ---------------------------------------------------------------------------
+-- Expression translator
+-- ---------------------------------------------------------------------------
+local current_fn_fixed_argc = 0
+local fn_names = {}
+
 local function translate_expr(expr)
-    expr=trim(expr)
-    if expr=="" then return "make_int(0)" end
-    if expr:sub(1,1)=='#' then return ("value_len(%s)"):format(translate_expr(expr:sub(2))) end
-    if expr:match("^not%s+") then return ("value_not(%s)"):format(translate_expr(expr:match("^not%s+(.+)$"))) end
-    if expr:sub(1,1)=='-'and is_int(expr:sub(2)) then return "make_int("..expr..")" end
-    if expr:sub(1,1)=='-'and is_flt(expr:sub(2)) then return "make_double("..expr..")" end
+    expr = trim(expr)
+    if expr == "" then return "make_int(0)" end
 
-    do local i=find_op(expr,{" or "})
-        if i then return("value_or(%s,%s)"):format(translate_expr(trim(expr:sub(1,i-1))),translate_expr(trim(expr:sub(i+4)))) end end
-    do local i=find_op(expr,{" and "})
-        if i then return("value_and(%s,%s)"):format(translate_expr(trim(expr:sub(1,i-1))),translate_expr(trim(expr:sub(i+5)))) end end
-    do local i,op=find_op(expr,{"==","~=","<=",">=","<",">"})
-        if i then
-            local fn=({["=="]="value_eq",["~="]="value_neq",["<="]="value_le",
-                       [">="]="value_ge",["<"]="value_lt",[">"]="value_gt"})[op]
-            return ("%s(%s,%s)"):format(fn,translate_expr(trim(expr:sub(1,i-1))),translate_expr(trim(expr:sub(i+#op))))
-        end end
-    do local i=find_op(expr,{".."})
-        if i then return("value_concat(%s,%s)"):format(translate_expr(trim(expr:sub(1,i-1))),translate_expr(trim(expr:sub(i+2)))) end end
+    if expr:match("^function%s*%(") then
+        return '(__extension__({lua_runtime_error("attempt to use closure (anonymous function): not supported in AOT compilation");LUA_UNREACHABLE();make_nil();}))'
+    end
 
-    -- additive (rightmost +/- at depth 0, left side must be non-empty)
-    do
-        local last_i,last_op
-        local d,i=0,1
-        while i<=#expr do
-            local ch=expr:sub(i,i)
-            if ch=='"'or ch=="'" then i=skip_str(expr,i)
-            elseif ch=='('or ch=='['or ch=='{' then d=d+1;i=i+1
-            elseif ch==')'or ch==']'or ch=='}' then d=d-1;i=i+1
-            elseif d==0 and(ch=='+'or ch=='-')and trim(expr:sub(1,i-1))~="" then last_i=i;last_op=ch;i=i+1
-            else i=i+1 end
-        end
-        if last_i then
-            return(last_op=='+'and"value_add"or"value_sub").."("..translate_expr(trim(expr:sub(1,last_i-1)))..",\z
-"..translate_expr(trim(expr:sub(last_i+1)))..")"
+    do local inner = expr:match("^select%s*%((.+)%)$")
+        if inner then
+            local sa = split_args(inner)
+            if #sa >= 1 then
+                local sel = trim(sa[1])
+                if sel=='"#"' or sel=="'#'" then
+                    return ("make_int(__nargs - %d)"):format(current_fn_fixed_argc)
+                elseif is_int(sel) then
+                    local n = tonumber(sel)
+                    if n and n > 0 then
+                        return ("(__nargs > %d ? value_copy(__args[%d]) : make_nil())"):format(
+                            current_fn_fixed_argc+n-1, current_fn_fixed_argc+n-1)
+                    elseif n and n < 0 then
+                        return ("(__nargs > %d ? value_copy(__args[__nargs+%d]) : make_nil())"):format(
+                            current_fn_fixed_argc, n)
+                    end
+                else
+                    return ("lua_select_vararg(%s,%d,__nargs,__args)"):format(
+                        translate_expr(sel), current_fn_fixed_argc)
+                end
+            end
         end
     end
 
-    do local li,lo=last_op_scan(expr,{["*"]=true,["/"]=true,["%"]=true})
+    if expr == "..." then
+        return ("(__nargs > %d ? value_copy(__args[%d]) : make_nil())"):format(
+            current_fn_fixed_argc, current_fn_fixed_argc)
+    end
+
+    if expr:match("^not%s+") then
+        return ("value_not(%s)"):format(translate_expr(expr:match("^not%s+(.+)$")))
+    end
+    if expr:sub(1,1)=='-' and is_int(expr:sub(2)) then return "make_int("..expr..")" end
+    if expr:sub(1,1)=='-' and is_flt(expr:sub(2)) then return "make_double("..expr..")" end
+
+    do local i = find_op(expr,{" or "})
+        if i then return ("value_or(%s,%s)"):format(
+            translate_expr(trim(expr:sub(1,i-1))), translate_expr(trim(expr:sub(i+4)))) end end
+    do local i = find_op(expr,{" and "})
+        if i then return ("value_and(%s,%s)"):format(
+            translate_expr(trim(expr:sub(1,i-1))), translate_expr(trim(expr:sub(i+5)))) end end
+    do local i,op = find_op(expr,{"==","~=","<=",">=","<",">"})
+        if i then
+            local fn = ({["=="]="value_eq",["~="]="value_neq",["<="]="value_le",
+                         [">="]="value_ge",["<"]="value_lt",[">"]="value_gt"})[op]
+            return ("%s(%s,%s)"):format(fn,
+                translate_expr(trim(expr:sub(1,i-1))), translate_expr(trim(expr:sub(i+#op))))
+        end end
+    do local i = find_op(expr,{".."})
+        if i then return ("value_concat(%s,%s)"):format(
+            translate_expr(trim(expr:sub(1,i-1))), translate_expr(trim(expr:sub(i+2)))) end end
+
+    do local i = find_op(expr,{"^"})
+        if i then return ("value_pow(%s,%s)"):format(
+            translate_expr(trim(expr:sub(1,i-1))), translate_expr(trim(expr:sub(i+1)))) end end
+
+    do local li, lo = last_additive(expr)
         if li then
-            return({["*"]="value_mul",["/"]="value_div",["%"]="value_mod"})[lo]
-                .."("..translate_expr(trim(expr:sub(1,li-1)))..",\z
+            return (lo=='+' and "value_add" or "value_sub").."("..
+                translate_expr(trim(expr:sub(1,li-1)))..",\z
 "..translate_expr(trim(expr:sub(li+1)))..")"
         end end
 
-    if expr:match("^%[%[") then local s=expr:match("^%[%[(.-)%]%]$"); if s then return('make_string("%s")'):format(escape_c(s)) end end
-    if is_str(expr)  then return('make_string("%s")'):format(lua_str_inner(expr)) end
+    do local li, lo = last_muldiv(expr)
+        if li then
+            return ({["*"]="value_mul",["/"]="value_div",["%"]="value_mod"})[lo].."("..
+                translate_expr(trim(expr:sub(1,li-1)))..",\z
+"..translate_expr(trim(expr:sub(li+1)))..")"
+        end end
+
+    if expr:sub(1,1)=='#' then return ("value_len(%s)"):format(translate_expr(expr:sub(2))) end
+    if expr:match("^%[%[") then
+        local s = expr:match("^%[%[(.-)%]%]$")
+        if s then return ('make_string("%s")'):format(escape_c(s)) end
+    end
+    if is_str(expr)  then return ('make_string("%s")'):format(lua_str_inner(expr)) end
     if is_int(expr)  then return "make_int("..expr..")" end
     if is_flt(expr)  then return "make_double("..expr..")" end
-    if expr=="true"  then return "make_bool(1)" end
-    if expr=="false" then return "make_bool(0)" end
-    if expr=="nil"   then return "make_nil()" end
+    if expr == "true"  then return "make_bool(1)" end
+    if expr == "false" then return "make_bool(0)" end
+    if expr == "nil"   then return "make_nil()" end
 
-    if expr:sub(1,1)=='{' then
-        local d,close=0,#expr
+    -- table constructor
+    if expr:sub(1,1) == '{' then
+        local d, close = 0, #expr
         for i2=1,#expr do local ch=expr:sub(i2,i2)
             if ch=='{' then d=d+1 elseif ch=='}' then d=d-1 end
-            if d==0 then close=i2;break end end
-        local inner=trim(expr:sub(2,close-1))
-        if inner=="" then return "make_table()" end
-        local parts,ai={},1
+            if d==0 then close=i2; break end end
+        local inner = trim(expr:sub(2,close-1))
+        if inner == "" then return "make_table()" end
+        if trim(inner) == "..." then
+            local tbl = newtmp()
+            local fixed = current_fn_fixed_argc
+            return ("(__extension__({Value %s=make_table();for(int __vi=%d;__vi<__nargs;__vi++)table_raw_set(%s.tbl,make_int(__vi-%d+1),value_copy(__args[__vi]));%s;}))"):format(
+                tbl, fixed, tbl, fixed, tbl)
+        end
+        local parts, ai = {}, 1
         for _,field in ipairs(split_args(inner)) do
-            field=trim(field)
-            local k,v=field:match("^([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.+)$")
+            field = trim(field)
+            local k,v = field:match("^([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.+)$")
             if k and v then
-                table.insert(parts,('make_string("%s")'):format(escape_c(k))); table.insert(parts,translate_expr(v))
+                table.insert(parts, ('make_string("%s")'):format(escape_c(k)))
+                table.insert(parts, translate_expr(v))
             else
-                local ke,ve=field:match("^%[(.+)%]%s*=%s*(.+)$")
-                if ke and ve then table.insert(parts,translate_expr(ke)); table.insert(parts,translate_expr(ve))
-                else table.insert(parts,"make_int("..ai..")"); table.insert(parts,translate_expr(field)); ai=ai+1 end
+                local ke,ve = field:match("^%[(.+)%]%s*=%s*(.+)$")
+                if ke and ve then
+                    table.insert(parts, translate_expr(ke)); table.insert(parts, translate_expr(ve))
+                else
+                    table.insert(parts, "make_int("..ai..")"); table.insert(parts, translate_expr(field)); ai=ai+1
+                end
             end
         end
-        return("table_init(%d,%s)"):format(#parts/2,table.concat(parts,","))
+        return ("table_init(%d,%s)"):format(#parts/2, table.concat(parts,","))
     end
 
-    do local a=expr:match("^error%s*%((.*)%)$")
-        if a then local args=split_args(a)
-            return("lua_error(%s)"):format(args[1] and translate_expr(trim(args[1])) or 'make_string("error")') end end
-    do local a=expr:match("^assert%s*%((.*)%)$")
-        if a then local args=split_args(a)
-            return("lua_assert(%s,%s)"):format(translate_expr(trim(args[1] or "")),
-                args[2] and translate_expr(trim(args[2])) or 'make_string("assertion failed!")') end end
-
-    -- method call obj:method(args)
-    do local found; depth_scan(expr,function(i,ch)
-        if ch==':' then
-            local obj=trim(expr:sub(1,i-1)); local rest=trim(expr:sub(i+1))
-            local meth,as=rest:match("^([A-Za-z_][A-Za-z0-9_]*)%s*%((.*)%)$")
-            if meth then
-                local args=split_args(as); local p={}
-                for _,a in ipairs(args) do table.insert(p,translate_expr(trim(a))) end
-                found=("value_method_call(%s,\"%s\",%d%s)"):format(
-                    translate_expr(obj),meth,#args,#args>0 and ","..table.concat(p,",") or "")
-                return true
-            end
+    local simple_builtins = {
+        {pat="^error%s*%((.*)%)$",      fn=function(a) return ("lua_error(%s)"):format(a[1] and translate_expr(trim(a[1])) or 'make_string("error")') end},
+        {pat="^assert%s*%((.*)%)$",     fn=function(a) return ("lua_assert(%s,%s)"):format(translate_expr(trim(a[1] or "")), a[2] and translate_expr(trim(a[2])) or 'make_string("assertion failed!")') end},
+        {pat="^tostring%s*%((.+)%)$",   fn=function(a) return ("lua_tostring(%s)"):format(translate_expr(a[1])) end, raw=true},
+        {pat="^tonumber%s*%((.+)%)$",   fn=function(a) return ("lua_tonumber(%s)"):format(translate_expr(a[1])) end, raw=true},
+        {pat="^type%s*%((.+)%)$",       fn=function(a) return ("lua_type(%s)"):format(translate_expr(a[1])) end, raw=true},
+        {pat="^ipairs%s*%((.+)%)$",     fn=function(a) return ("value_copy(%s)"):format(translate_expr(a[1])) end, raw=true},
+        {pat="^pairs%s*%((.+)%)$",      fn=function(a) return ("value_copy(%s)"):format(translate_expr(a[1])) end, raw=true},
+    }
+    for _,b in ipairs(simple_builtins) do
+        local inner = expr:match(b.pat)
+        if inner then
+            local a = b.raw and {inner} or split_args(inner)
+            return b.fn(a)
         end
-    end); if found then return found end end
+    end
 
-    -- suffix walker: call / index / dot
-    do
-        local ss,st
-        -- manual walk tracking depth for suffix detection
-        local d2,i=0,1
-        while i<=#expr do
-            local ch=expr:sub(i,i)
-            if ch=='"'or ch=="'" then i=skip_str(expr,i)
-            elseif ch=='('or ch=='['or ch=='{' then
-                if d2==0 and i>1 then
-                    if ch=='(' then ss=i;st='call' elseif ch=='[' then ss=i;st='index' end
+    do local inner = expr:match("^rawget%s*%((.+)%)$")
+        if inner then
+            local ga = split_args(inner)
+            return ("table_get(%s,%s)"):format(translate_expr(trim(ga[1] or "")), translate_expr(trim(ga[2] or "")))
+        end end
+
+    do local fn, fa = expr:match("^string%.([A-Za-z_][A-Za-z0-9_]*)%s*%((.*)%)$")
+        if fn then
+            local args = split_args(fa); local p = {}
+            for _,a in ipairs(args) do table.insert(p, translate_expr(trim(a))) end
+            local _,call = build_array_call("lua_string_"..fn, p)
+            return call
+        end end
+
+    do local found
+        depth_scan(expr, function(i, ch)
+            if ch == ':' then
+                local obj  = trim(expr:sub(1,i-1))
+                local rest = trim(expr:sub(i+1))
+                local meth, as = rest:match("^([A-Za-z_][A-Za-z0-9_]*)%s*%((.*)%)$")
+                if meth then
+                    local args = split_args(as); local p = {}
+                    for _,a in ipairs(args) do table.insert(p, translate_expr(trim(a))) end
+                    local str_methods = {find=1,match=1,gmatch=1,gsub=1,sub=1,
+                        len=1,format=1,rep=1,reverse=1,upper=1,lower=1,byte=1,char=1,dump=1}
+                    if str_methods[meth] then
+                        local all = {translate_expr(obj)}
+                        for _,pa in ipairs(p) do table.insert(all, pa) end
+                        local _,call = build_array_call("lua_string_"..meth, all)
+                        found = call
+                    else
+                        found = ("value_method_call(%s,\"%s\",%d%s)"):format(
+                            translate_expr(obj), meth, #args,
+                            #args>0 and ","..table.concat(p,",") or "")
+                    end
+                    return true
                 end
-                d2=d2+1;i=i+1
-            elseif ch==')'or ch==']'or ch=='}' then d2=d2-1;i=i+1
-            elseif ch=='.'and d2==0 and i>1 then
-                local rest=expr:sub(i+1); local key=rest:match("^([A-Za-z_][A-Za-z0-9_]*)")
-                if key and rest:sub(#key+1,#key+1)~='(' then ss=i;st='dot' end
+            end
+        end)
+        if found then return found end end
+
+    do
+        local ss, st, d2 = nil, nil, 0
+        local i = 1
+        while i <= #expr do
+            local ch = expr:sub(i,i)
+            if ch=='"' or ch=="'" then i=skip_str(expr,i)
+            elseif ch=='(' or ch=='[' or ch=='{' then
+                if d2==0 and i>1 then
+                    if ch=='(' then ss=i; st='call' elseif ch=='[' then ss=i; st='index' end
+                end
+                d2=d2+1; i=i+1
+            elseif ch==')' or ch==']' or ch=='}' then d2=d2-1; i=i+1
+            elseif ch=='.' and d2==0 and i>1 then
+                local rest = expr:sub(i+1)
+                local key  = rest:match("^([A-Za-z_][A-Za-z0-9_]*)")
+                if key and rest:sub(#key+1,#key+1) ~= '(' then ss=i; st='dot' end
                 i=i+1
             else i=i+1 end
         end
 
         if ss and st=='call' then
-            local d3,cp=0,#expr
+            local d3, cp = 0, #expr
             for j=ss,#expr do local ch=expr:sub(j,j)
                 if ch=='(' then d3=d3+1 elseif ch==')' then d3=d3-1 end
-                if d3==0 then cp=j;break end end
-            local fn_e=trim(expr:sub(1,ss-1))
-            local as=trim(expr:sub(ss+1,cp-1))
-            local args=as~="" and split_args(as) or {}
-            local parts={}; for _,a in ipairs(args) do table.insert(parts,translate_expr(a)) end
-            local sep=#parts>0 and ","..table.concat(parts,",") or ""
-            local dobj,dkey=fn_e:match("^(.+)%.([A-Za-z_][A-Za-z0-9_]*)$")
-            if dobj then return("table_call(%s,make_string(\"%s\"),%d%s)"):format(translate_expr(dobj),escape_c(dkey),#parts,sep) end
-            if is_id(fn_e) then return fn_e.."("..table.concat(parts,",")..")" end
-            return("value_call(%s,%d%s)"):format(translate_expr(fn_e),#parts,sep)
+                if d3==0 then cp=j; break end end
+            local fn_e = trim(expr:sub(1,ss-1))
+            local as   = trim(expr:sub(ss+1,cp-1))
+            local args = as ~= "" and split_args(as) or {}
+            local parts = {}
+            for ai,a in ipairs(args) do
+                if trim(a)=="..." and ai==#args then
+                    table.insert(parts, ("__nargs - %d"):format(current_fn_fixed_argc))
+                    table.insert(parts, ("__args + %d"):format(current_fn_fixed_argc))
+                    local sep = table.concat(parts,",")
+                    local dobj, dkey = fn_e:match("^(.+)%.([A-Za-z_][A-Za-z0-9_]*)$")
+                    if dobj then
+                        return ("table_call_splice(%s,make_string(\"%s\"),%s)"):format(
+                            translate_expr(dobj), escape_c(dkey), sep)
+                    end
+                    local fn_val = fn_names[fn_e] and ("make_func(%s)"):format(fn_e) or ("value_copy(%s)"):format(fn_e)
+                    return ("value_call_splice(%s,%s)"):format(fn_val, sep)
+                else
+                    table.insert(parts, translate_expr(trim(a)))
+                end
+            end
+            local sep = #parts>0 and ","..table.concat(parts,",") or ""
+            local dobj, dkey = fn_e:match("^(.+)%.([A-Za-z_][A-Za-z0-9_]*)$")
+            if dobj then
+                return ("table_call(%s,make_string(\"%s\"),%d%s)"):format(
+                    translate_expr(dobj), escape_c(dkey), #parts, sep)
+            end
+            local fn_val = fn_names[fn_e] and ("make_func(%s)"):format(fn_e) or ("value_copy(%s)"):format(fn_e)
+            return ("value_call(%s,%d%s)"):format(fn_val, #parts, sep)
+
         elseif ss and st=='index' then
-            local d3,cb=0,#expr
+            local d3, cb = 0, #expr
             for j=ss,#expr do local ch=expr:sub(j,j)
                 if ch=='[' then d3=d3+1 elseif ch==']' then d3=d3-1 end
-                if d3==0 then cb=j;break end end
-            return("table_get(%s,%s)"):format(translate_expr(trim(expr:sub(1,ss-1))),translate_expr(trim(expr:sub(ss+1,cb-1))))
+                if d3==0 then cb=j; break end end
+            return ("table_get(%s,%s)"):format(
+                translate_expr(trim(expr:sub(1,ss-1))),
+                translate_expr(trim(expr:sub(ss+1,cb-1))))
+
         elseif ss and st=='dot' then
-            local te=trim(expr:sub(1,ss-1)); local key=expr:sub(ss+1):match("^([A-Za-z_][A-Za-z0-9_]*)")
-            if key and te~="" then return('table_get(%s,make_string("%s"))'):format(translate_expr(te),escape_c(key)) end
+            local te  = trim(expr:sub(1,ss-1))
+            local key = expr:sub(ss+1):match("^([A-Za-z_][A-Za-z0-9_]*)")
+            if key and te ~= "" then
+                return ('table_get(%s,make_string("%s"))'):format(translate_expr(te), escape_c(key))
+            end
         end
     end
 
-    if is_id(expr) then return "value_copy("..expr..")" end
-    do local inner=expr:match("^%((.+)%)$"); if inner then return translate_expr(inner) end end
+    if is_id(expr) then
+        if fn_names[expr] then return ("make_func(%s)"):format(expr) end
+        return "value_copy("..expr..")"
+    end
+    do local inner = expr:match("^%((.+)%)$"); if inner then return translate_expr(inner) end end
     return expr
 end
 
 -- ---------------------------------------------------------------------------
--- Read + pre-process source
+-- Source pre-processing
 -- ---------------------------------------------------------------------------
-local raw_src=assert(io.open(input_path)):read("*a")
-raw_src=raw_src:gsub("%[%[(.-)%]%]",function(s)
-    return '"'..s:gsub("\\","\\\\"):gsub('"','\\"'):gsub("\r\n",LONG_STR_NL):gsub("\n",LONG_STR_NL):gsub("\r",LONG_STR_NL)..'"'
+local raw_src = assert(io.open(input_path)):read("*a")
+raw_src = raw_src:gsub('\\z[ \t]*\n[ \t]*','')
+raw_src = raw_src:gsub("%[%[(.-)%]%]", function(s)
+    return '"'..s:gsub("\\","\\\\"):gsub('"','\\"')
+                 :gsub("\r\n",LONG_STR_NL):gsub("\n",LONG_STR_NL):gsub("\r",LONG_STR_NL)..'"'
 end)
-local raw_lines={}
+local raw_lines = {}
 for l in (raw_src.."\n"):gmatch("([^\n]*)\n") do table.insert(raw_lines,l) end
 
 local function brace_depth(line)
-    local depth,i,in_s,sq=0,1,false,nil
-    while i<=#line do
-        local ch=line:sub(i,i)
+    local depth, i, in_s, sq = 0, 1, false, nil
+    while i <= #line do
+        local ch = line:sub(i,i)
         if in_s then
-            if ch=='\\' then i=i+2 elseif ch==sq then in_s=false;i=i+1 else i=i+1 end
+            if ch=='\\' then i=i+2 elseif ch==sq then in_s=false; i=i+1 else i=i+1 end
         else
-            if ch=='"'or ch=="'" then in_s=true;sq=ch;i=i+1
-            elseif ch=='{' then depth=depth+1;i=i+1
-            elseif ch=='}' then depth=depth-1;i=i+1
-            elseif ch=='-'and line:sub(i,i+1)=='--' then break
+            if ch=='"' or ch=="'" then in_s=true; sq=ch; i=i+1
+            elseif ch=='{' then depth=depth+1; i=i+1
+            elseif ch=='}' then depth=depth-1; i=i+1
+            elseif ch=='-' and line:sub(i,i+1)=='--' then break
             else i=i+1 end
         end
     end
     return depth
 end
 
-local lines={}
-do local i=1
-    while i<=#raw_lines do
-        local combined=raw_lines[i]; local depth=brace_depth(combined)
-        while depth>0 and i<#raw_lines do
+local lines = {}
+do local i = 1
+    while i <= #raw_lines do
+        local combined = raw_lines[i]; local depth = brace_depth(combined)
+        while depth > 0 and i < #raw_lines do
             i=i+1; combined=combined.." "..trim(raw_lines[i]); depth=depth+brace_depth(raw_lines[i])
         end
-        table.insert(lines,combined); i=i+1
+        table.insert(lines, combined); i=i+1
     end
 end
 
--- ---------------------------------------------------------------------------
--- Parse top-level: split functions vs statements
--- ---------------------------------------------------------------------------
-local functions,topstmts={},{}
+local function line_block_delta(s)
+    local delta = 0; local i = 1
+    local s_trimmed = s:match("^%s*(.-)%s*$") or s
+    local starts_with_do = s_trimmed:match("^do%s") or s_trimmed == "do"
+    while i <= #s do
+        local ch = s:sub(i,i)
+        if ch=='"' or ch=="'" then i=skip_str(s,i)
+        elseif ch=='-' and s:sub(i,i+1)=='--' then break
+        else
+            local kw = s:sub(i):match("^([A-Za-z_][A-Za-z0-9_]*)")
+            if kw then
+                local prev = i>1 and s:sub(i-1,i-1) or ""
+                if not prev:match("[A-Za-z0-9_]") then
+                    if kw=="function" or kw=="if" or kw=="for"
+                    or kw=="while"   or kw=="repeat" then delta=delta+1
+                    elseif kw=="do" and starts_with_do then delta=delta+1
+                    elseif kw=="end" or kw=="until" then delta=delta-1 end
+                end
+                i=i+#kw
+            else i=i+1 end
+        end
+    end
+    return delta
+end
+
+local functions, topstmts = {}, {}
 
 local function opens_block(ts)
-    return ts:match("^if%s")or ts:match("^for%s")or ts:match("^while%s")
-        or ts:match("^function%s")or ts:match("^local%s+function%s")
-        or ts=="do"or ts:match("^do%s")or ts:match("^repeat$")or ts:match("^repeat%s")
+    return ts:match("^if%s") or ts:match("^for%s") or ts:match("^while%s")
+        or ts:match("^function%s") or ts:match("^local%s+function%s")
+        or ts=="do" or ts:match("^do%s") or ts:match("^repeat$") or ts:match("^repeat%s")
 end
 
-local i,n=1,#lines
-while i<=n do
-    local line=lines[i]; local s=trim(line)
-    if s==""or s:match("^%-%-") then i=i+1
-    elseif s:match("^function%s")or s:match("^local%s+function%s") then
-        local name,args=s:match("^%s*function%s+([A-Za-z_][A-Za-z0-9_]*)%s*%((.-)%)")
-        if not name then name,args=s:match("^%s*local%s+function%s+([A-Za-z_][A-Za-z0-9_]*)%s*%((.-)%)") end
+local i, n = 1, #lines
+while i <= n do
+    local line = lines[i]; local s = trim(line)
+    if s=="" or s:match("^%-%-") then i=i+1
+    elseif s:match("^function%s") or s:match("^local%s+function%s") then
+        local name, args = s:match("^%s*function%s+([A-Za-z_][A-Za-z0-9_]*)%s*%((.-)%)")
+        if not name then name,args = s:match("^%s*local%s+function%s+([A-Za-z_][A-Za-z0-9_]*)%s*%((.-)%)") end
         if not name then
-            local t2,m2,ma=s:match("^%s*function%s+([A-Za-z_][A-Za-z0-9_]*)[.:]([A-Za-z_][A-Za-z0-9_]*)%s*%((.-)%)")
-            if t2 then name=t2.."__"..m2;args=ma end
+            local t2,m2,ma = s:match("^%s*function%s+([A-Za-z_][A-Za-z0-9_]*)[.:]([A-Za-z_][A-Za-z0-9_]*)%s*%((.-)%)")
+            if t2 then name=t2.."__"..m2; args=ma end
         end
-        args=trim(args or "")
-        local body={};i=i+1;local depth=1
-        while i<=n do
-            local l=lines[i];local ts2=trim(l)
-            if opens_block(ts2) then depth=depth+1 end
-            if ts2=="end" then depth=depth-1;if depth==0 then break end end
-            table.insert(body,l);i=i+1
+        args = trim(args or "")
+        local body = {}
+        local is_single = false
+        do
+            local fn_pos = s:find("function%s")
+            local op = fn_pos and s:find("%(", fn_pos)
+            if op then
+                local pd, pi = 0, op
+                while pi <= #s do
+                    local pc = s:sub(pi,pi)
+                    if pc=='(' then pd=pd+1 elseif pc==')' then pd=pd-1; if pd==0 then break end end
+                    pi=pi+1
+                end
+                local after = trim(s:sub(pi+1))
+                local bstr  = after:match("^(.-)%s*end$")
+                if bstr ~= nil then is_single=true; if trim(bstr)~="" then body={trim(bstr)} end end
+            end
         end
-        functions[#functions+1]={name=name,args=args,body=body};i=i+1
-    else table.insert(topstmts,line);i=i+1 end
+        if is_single then
+            functions[#functions+1]={name=name,args=args,body=body}; fn_names[name]=true; i=i+1
+        else
+            i=i+1; local depth=1
+            while i<=n do
+                local ts2=trim(lines[i]); depth=depth+line_block_delta(ts2)
+                if depth==0 then i=i+1; break end
+                table.insert(body,lines[i]); i=i+1
+            end
+            functions[#functions+1]={name=name,args=args,body=body}; fn_names[name]=true
+        end
+    else table.insert(topstmts,line); i=i+1 end
 end
 
-local globals,builtin_globals={},{math=true,os=true,io=true}
+local globals, builtin_globals = {}, {math=true,os=true,io=true,arg=true,string=true}
 for _,line in ipairs(topstmts) do
-    local s=trim(line)
-    local v=s:match("^local%s+([A-Za-z_][A-Za-z0-9_]*)")or s:match("^([A-Za-z_][A-Za-z0-9_]*)%s*=")
+    local s = trim(line)
+    local v = s:match("^local%s+([A-Za-z_][A-Za-z0-9_]*)") or s:match("^([A-Za-z_][A-Za-z0-9_]*)%s*=")
     if v and not builtin_globals[v] then globals[v]=true end
-end
-
-local tmp_counter=0
-local function newtmp() tmp_counter=tmp_counter+1; return "__tmp"..tmp_counter end
-
-local function collect_block(src,si)
-    local body={};local depth=1;local j=si
-    while j<=#src do
-        local L=trim(src[j])
-        if opens_block(L) then depth=depth+1 end
-        if L=="end" then depth=depth-1;if depth==0 then return body,(j-si+1) end end
-        table.insert(body,src[j]);j=j+1
+    local vlist_str = s:match("^local%s+([A-Za-z_][A-Za-z0-9_]*%s*,.+)$")
+        or s:match("^([A-Za-z_][A-Za-z0-9_]*%s*,[A-Za-z0-9_%s,]*)%s*=")
+    if vlist_str then
+        vlist_str = vlist_str:match("^(.-)%s*=.*$") or vlist_str
+        for vname in vlist_str:gmatch("[A-Za-z_][A-Za-z0-9_]*") do
+            if not builtin_globals[vname] then globals[vname]=true end
+        end
     end
-    return body,(j-si)
+end
+
+local function collect_block(src, si)
+    local body = {}; local depth = 1; local j = si
+    while j <= #src do
+        local L = trim(src[j]); depth = depth + line_block_delta(L)
+        if depth == 0 then return body, (j - si + 1) end
+        table.insert(body, src[j]); j=j+1
+    end
+    return body, (j - si)
 end
 
 -- ---------------------------------------------------------------------------
--- Shared statement generation
--- ctx = { is_top=bool, local_vars=table|nil, assigned=table, globals=table, stmts=table,
---         loop_vars=table (stack of {var,...} to free on return inside loops) }
+-- Code generation
 -- ---------------------------------------------------------------------------
-local gen_stmt  -- forward decl
+local gen_stmt
 
--- Emit free_value calls for all locals currently in scope (for return paths)
 local function emit_scope_cleanup(ctx)
-    local code=""
+    local code = ""
     if ctx.local_vars then
-        for v,_ in pairs(ctx.local_vars) do
-            code=code..("    free_value(%s);\n"):format(v)
+        for v in pairs(ctx.local_vars) do
+            code = code..("    free_value(%s);\n"):format(v)
+        end
+    end
+    return code
+end
+
+-- FIX-B8: emit cleanup for all locals in ctx *except* loop iteration vars,
+-- used before a break statement so no values leak when breaking early.
+local function emit_break_cleanup(ctx, skip_vars)
+    local code = ""
+    if ctx.local_vars then
+        for v in pairs(ctx.local_vars) do
+            if not (skip_vars and skip_vars[v]) then
+                code = code..("    free_value(%s);\n"):format(v)
+            end
         end
     end
     return code
 end
 
 local function gen_print(pargs)
-    local args=split_args(pargs); local nn=#args; local arr=newtmp()
-    local code=("    Value %s[%d];\n"):format(arr,math.max(nn,1))
+    local args = split_args(pargs); local nn = #args; local arr = newtmp()
+    local code = ("    Value %s[%d];\n"):format(arr, math.max(nn,1))
     for ii,a in ipairs(args) do code=code..("    %s[%d]=%s;\n"):format(arr,ii-1,translate_expr(trim(a))) end
     return code..("    print_values(%d,%s);\n"):format(nn,arr)
 end
 
 local function gen_assert_stmt(s)
-    local args=split_args(s:match("^assert%s*%((.*)%)$"))
-    local ce=translate_expr(trim(args[1]or""))
-    local me=args[2] and translate_expr(trim(args[2])) or 'make_string("assertion failed!")'
-    local tmp=newtmp()
-    return("    Value %s=lua_assert(%s,%s);\n    free_value(%s);\n"):format(tmp,ce,me,tmp)
+    local args = split_args(s:match("^assert%s*%((.*)%)$"))
+    local ce = translate_expr(trim(args[1] or ""))
+    local me = args[2] and translate_expr(trim(args[2])) or 'make_string("assertion failed!")'
+    local tmp = newtmp()
+    return ("    Value %s=lua_assert(%s,%s);\n    free_value(%s);\n"):format(tmp,ce,me,tmp)
 end
 
-local function gen_if(s,ctx,idx,src)
-    -- inline single-line if?
-    local function find_then(str)
-        local then_pos
-        local d2,i2=0,1
-        while i2<=#str do
-            local ch=str:sub(i2,i2)
-            if ch=='"'or ch=="'" then i2=skip_str(str,i2)
-            elseif ch=='('or ch=='['or ch=='{' then d2=d2+1;i2=i2+1
-            elseif ch==')'or ch==']'or ch=='}' then d2=d2-1;i2=i2+1
-            elseif d2==0 and str:sub(i2,i2+4)==" then" then
-                local af=str:sub(i2+5,i2+5)
-                if af==""or af==" "or af=="\t" then then_pos=i2;break end
-                i2=i2+1
-            else i2=i2+1 end
-        end
-        return then_pos
+local function find_then(str)
+    local then_pos
+    local d, i = 0, 1
+    while i <= #str do
+        local ch = str:sub(i,i)
+        if ch=='"' or ch=="'" then i=skip_str(str,i)
+        elseif ch=='(' or ch=='[' or ch=='{' then d=d+1; i=i+1
+        elseif ch==')' or ch==']' or ch=='}' then d=d-1; i=i+1
+        elseif d==0 and str:sub(i,i+4)==" then" then
+            local af = str:sub(i+5,i+5)
+            if af=="" or af==" " or af=="\t" then then_pos=i; break end
+            i=i+1
+        else i=i+1 end
     end
+    return then_pos
+end
 
-    local inline_result
+local function gen_if(s, ctx, idx, src)
     if s:match("%send$") or s=="end" then
-        local tp=find_then(s)
+        local tp = find_then(s)
         if tp then
-            local cond=trim(s:sub(4,tp-1)); local rest=trim(s:sub(tp+5))
+            local cond = trim(s:sub(4,tp-1)); local rest = trim(s:sub(tp+5))
             if rest:match("end$") then
-                rest=trim(rest:sub(1,-4))
-                local ep; do local d3,i3=0,1; while i3<=#rest do
+                rest = trim(rest:sub(1,-4))
+                local ep
+                do local d3,i3=0,1; while i3<=#rest do
                     local ch=rest:sub(i3,i3)
-                    if ch=='"'or ch=="'" then i3=skip_str(rest,i3)
-                    elseif ch=='('or ch=='['or ch=='{' then d3=d3+1;i3=i3+1
-                    elseif ch==')'or ch==']'or ch=='}' then d3=d3-1;i3=i3+1
-                    elseif d3==0 and rest:sub(i3,i3+5)==" else " then ep=i3;break
+                    if ch=='"' or ch=="'" then i3=skip_str(rest,i3)
+                    elseif ch=='(' or ch=='[' or ch=='{' then d3=d3+1; i3=i3+1
+                    elseif ch==')' or ch==']' or ch=='}' then d3=d3-1; i3=i3+1
+                    elseif d3==0 and rest:sub(i3,i3+5)==" else " then ep=i3; break
                     else i3=i3+1 end
                 end end
-                local function gs2(st)
-                    local code=""
-                    for _,st2 in ipairs(st) do if trim(st2)~="" then
-                        local r,_=gen_stmt({st2},1,ctx); code=code..r end end
+                local function gs2(st_list)
+                    local code = ""
+                    for _,st2 in ipairs(st_list) do if trim(st2)~="" then
+                        local r = gen_stmt({st2},1,ctx); code=code..r end end
                     return code
                 end
-                local tmp=newtmp();local cv=newtmp()
-                local code=("    Value %s=%s;\n    int %s=value_is_truthy(%s);\n    free_value(%s);\n    if(%s){\n"):format(
-                    tmp,translate_expr(cond),cv,tmp,tmp,cv)
+                local tmp,cv = newtmp(), newtmp()
+                local code = ("    Value %s=%s;\n    int %s=value_is_truthy(%s);\n    free_value(%s);\n    if(%s){\n"):format(
+                    tmp, translate_expr(cond), cv, tmp, tmp, cv)
                 if ep then
-                    code=code..gs2({trim(rest:sub(1,ep-1))}).."    }else{\n"..gs2({trim(rest:sub(ep+6))}).."    }\n"
-                else code=code..gs2({rest}).."    }\n" end
-                inline_result=code
+                    code = code..gs2({trim(rest:sub(1,ep-1))}).."    }else{\n"..gs2({trim(rest:sub(ep+6))}).."    }\n"
+                else code = code..gs2({rest}).."    }\n" end
+                return code, 1
             end
         end
     end
-    if inline_result then return inline_result,1 end
 
-    local clauses={}
-    local cond=trim((s:match("^if%s+(.+)%s+then$")or s:match("^if%s+(.+)$")or""):gsub("%s+then$",""))
-    clauses[1]={kind="if",cond=cond,body={}}
-    local depth=1;local j=idx+1
-    while j<=#src do
-        local L=trim(src[j])
-        if opens_block(L) then depth=depth+1;table.insert(clauses[#clauses].body,src[j]);j=j+1
-        elseif depth>1 then
+    local cond, inline_body_line
+    do
+        local tp = find_then(s)
+        if tp then
+            cond = trim(s:sub(4,tp-1)); inline_body_line = trim(s:sub(tp+5))
+        else cond = trim(s:match("^if%s+(.+)$") or ""); inline_body_line = "" end
+    end
+
+    local clauses = {{kind="if",cond=cond,body={}}}
+    if inline_body_line ~= "" then table.insert(clauses[1].body, inline_body_line) end
+    local depth = 1; local j = idx+1
+    while j <= #src do
+        local L = trim(src[j])
+        if opens_block(L) then depth=depth+1; table.insert(clauses[#clauses].body,src[j]); j=j+1
+        elseif depth > 1 then
             if L=="end" then depth=depth-1 end
-            table.insert(clauses[#clauses].body,src[j]);j=j+1
+            table.insert(clauses[#clauses].body,src[j]); j=j+1
         else
             if L:match("^elseif%s") then
-                local c=trim((L:match("^elseif%s+(.+)%s+then$")or L:match("^elseif%s+(.+)$")or""):gsub("%s+then$",""))
-                clauses[#clauses+1]={kind="elseif",cond=c,body={}};j=j+1
-            elseif L=="else"or L:match("^else%s*$") then clauses[#clauses+1]={kind="else",body={}};j=j+1
-            elseif L=="end" then j=j+1;break
-            else table.insert(clauses[#clauses].body,src[j]);j=j+1 end
+                local etp = find_then(L)
+                local ec, eb
+                if etp then ec=trim(L:sub(8,etp-1)); eb=trim(L:sub(etp+5))
+                else ec=trim(L:match("^elseif%s+(.+)$") or ""); eb="" end
+                clauses[#clauses+1]={kind="elseif",cond=ec,body={}}; j=j+1
+                if eb ~= "" then table.insert(clauses[#clauses].body, eb) end
+            elseif L=="else" or L:match("^else%s*$") then
+                clauses[#clauses+1]={kind="else",body={}}; j=j+1
+            elseif L=="end" then j=j+1; break
+            else table.insert(clauses[#clauses].body,src[j]); j=j+1 end
         end
     end
-    local function gen_clauses(cls,ci)
-        if ci>#cls then return "" end; local cl=cls[ci]
-        local function gen_body(b)
-            local bc="";local bi=1
-            while bi<=#b do local st,c2=gen_stmt(b,bi,ctx);bc=bc..st;bi=bi+c2 end
-            return bc
-        end
-        if cl.kind=="if"or cl.kind=="elseif" then
-            local tmp=newtmp();local cv=newtmp()
-            local code=("    Value %s=%s;\n    int %s=value_is_truthy(%s);\n    free_value(%s);\n    if(%s){\n"):format(
-                tmp,translate_expr(cl.cond),cv,tmp,tmp,cv)
-            code=code..gen_body(cl.body)
-            if ci<#cls then return code.."    }else{\n"..gen_clauses(cls,ci+1).."    }\n"
+
+    local function gen_body(b)
+        local bc=""; local bi=1
+        while bi<=#b do local st,c2=gen_stmt(b,bi,ctx); bc=bc..st; bi=bi+c2 end
+        return bc
+    end
+    local function gen_clauses(cls, ci)
+        if ci > #cls then return "" end; local cl = cls[ci]
+        if cl.kind=="if" or cl.kind=="elseif" then
+            local tmp,cv = newtmp(), newtmp()
+            local code = ("    Value %s=%s;\n    int %s=value_is_truthy(%s);\n    free_value(%s);\n    if(%s){\n"):format(
+                tmp, translate_expr(cl.cond), cv, tmp, tmp, cv)
+            code = code..gen_body(cl.body)
+            if ci < #cls then return code.."    }else{\n"..gen_clauses(cls,ci+1).."    }\n"
             else return code.."    }\n" end
         else return gen_body(cl.body) end
     end
-    return gen_clauses(clauses,1),(j-idx)
+    return gen_clauses(clauses, 1), (j-idx)
 end
 
-local function gen_for(s,ctx,idx,src)
-    local var,se,le,ste=s:match("^for%s+([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.-)%s*,%s*(.-)%s*,%s*(.-)%s+do$")
-    if not var then var,se,le=s:match("^for%s+([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.-)%s*,%s*(.-)%s+do$") end
-    if not var then return nil end
-    local for_body,consumed=collect_block(src,idx+1)
-    local sv,lv,stv=newtmp(),newtmp(),newtmp()
-    local code=("    Value %s=%s;\n    Value %s=%s;\n    Value %s=%s;\n"):format(
-        sv,translate_expr(se),lv,translate_expr(le),stv,ste and translate_expr(ste) or "make_int(1)")
-    code=code..("    for(int64_t __i_%s=%s.i;(%s.i>=0?__i_%s<=%s.i:__i_%s>=%s.i);__i_%s+=%s.i){\n"):format(
-        var,sv,stv,var,lv,var,lv,var,stv)
-    code=code..("        Value %s=make_int(__i_%s);\n"):format(var,var)
-
-    -- snapshot locals so inner-loop locals get freed
-    local saved_lv={}
+local function loop_save(ctx)
+    local saved_lv = {}
     if ctx.local_vars then for k,v in pairs(ctx.local_vars) do saved_lv[k]=v end end
-    local saved_am={}; for k,v in pairs(ctx.assigned) do saved_am[k]=v end
+    local saved_am = {}; for k,v in pairs(ctx.assigned) do saved_am[k]=v end
+    local before = {}
+    if ctx.local_vars then for k in pairs(ctx.local_vars) do before[k]=true end end
+    return saved_lv, saved_am, before
+end
 
-    -- Create a child context that tracks its own new locals, but shares the same local_vars table
-    -- so that return statements inside the loop can emit cleanup for loop-body locals.
-    -- We track which vars are new inside the loop so we can free them at loop bottom.
-    local vars_before={}
-    if ctx.local_vars then for k,_ in pairs(ctx.local_vars) do vars_before[k]=true end end
-
-    if ctx.local_vars then ctx.local_vars[var]=true end
-    local loop_ctx=ctx
-    -- push loop_var onto ctx so return-inside-loop knows to free it
-    local old_loop_vars=ctx.loop_vars or {}
-    ctx.loop_vars={var}
-    setmetatable(ctx.loop_vars,{__index=old_loop_vars})
-
-    local bi=1
-    while bi<=#for_body do local st,c2=gen_stmt(for_body,bi,loop_ctx);code=code..st;bi=bi+c2 end
-
-    -- Free any locals declared inside the loop body (but not the loop var itself yet)
+local function loop_restore(ctx, saved_lv, saved_am, before, loop_vars, indent)
+    local code = ""
     if ctx.local_vars then
-        for v,_ in pairs(ctx.local_vars) do
-            if not vars_before[v] and v~=var then
-                code=code..("        free_value(%s);\n"):format(v)
-            end
+        for v in pairs(ctx.local_vars) do
+            if not before[v] then code=code..(indent.."free_value(%s);\n"):format(v) end
         end
-        ctx.local_vars=saved_lv
-        -- Restore the loop var slot (it was in saved_lv if it was declared before the loop,
-        -- but as a for-loop var it's re-created each iteration)
-        if ctx.local_vars then ctx.local_vars[var]=nil end
+        ctx.local_vars = saved_lv
+        for _,lv in ipairs(loop_vars) do if ctx.local_vars then ctx.local_vars[lv]=nil end end
+    end
+    ctx.assigned = saved_am
+    return code
+end
+
+local function gen_ipairs_loop(tbl_expr, vars, for_body, ctx)
+    local tbl_tmp = newtmp()
+    local ivar = vars[1] or "_"
+    local vvar = vars[2]
+    local idx_c = newtmp()
+    local bflag = newtmp()   -- FIX-B8: break flag
+    local code = ("    Value %s=%s;\n"):format(tbl_tmp, tbl_expr)
+    code = code..("    for(int64_t %s=1;;%s++){\n"):format(idx_c, idx_c)
+    code = code..("        int %s=0;\n"):format(bflag)
+    code = code..("        Value %s=make_int(%s);\n"):format(ivar, idx_c)
+    if vvar then
+        code = code..("        Value %s=table_get(value_copy(%s),make_int(%s));\n"):format(vvar, tbl_tmp, idx_c)
+        code = code..("        if(%s.t==T_NIL){free_value(%s);free_value(%s);break;}\n"):format(vvar, ivar, vvar)
+    else
+        local chk = newtmp()
+        code = code..("        Value %s=table_get(value_copy(%s),make_int(%s));\n"):format(chk, tbl_tmp, idx_c)
+        code = code..("        if(%s.t==T_NIL){free_value(%s);free_value(%s);break;}\n"):format(chk, ivar, chk)
+        code = code..("        free_value(%s);\n"):format(chk)
     end
 
-    ctx.assigned=saved_am
-    ctx.loop_vars=old_loop_vars
+    local saved_lv, saved_am, before = loop_save(ctx)
+    if ctx.local_vars then
+        ctx.local_vars[ivar] = true
+        if vvar then ctx.local_vars[vvar] = true end
+    end
 
-    return code..("        free_value(%s);\n    }\n"):format(var)
-        ..("    free_value(%s);free_value(%s);free_value(%s);\n"):format(sv,lv,stv), 1+consumed
+    -- Wrap body so break goes through cleanup
+    -- We need a nested block; we rely on gen_stmt emitting break statements
+    -- but we intercept them via break-flag. However since gen_stmt emits raw
+    -- "break;" we instead wrap with a do{}while(0) + break flag approach.
+    -- Simple approach: body goes into a switch(0) default: block which allows break.
+    -- Actually the cleanest is to push ctx.break_cleanup so gen_stmt can use it.
+    -- We'll use a simpler approach: wrap in do{}while(0), translate break->set flag.
+    -- Since we can't easily intercept gen_stmt's "break", we use the flag at end.
+
+    -- Store the break-flag name in ctx so gen_stmt can emit flag+cleanup instead of bare break
+    local prev_bflag = ctx.break_flag
+    local prev_bcleanup = ctx.break_cleanup
+    -- cleanup that must run on break: ivar + vvar + any body locals added after
+    local iter_vars_set = {[ivar]=true}
+    if vvar then iter_vars_set[vvar]=true end
+    ctx.break_flag = bflag
+    ctx.break_cleanup = function()
+        -- free iter vars + any body locals allocated so far (snapshot at break time not possible,
+        -- so we free all locals in scope at break point via ctx.local_vars at gen time)
+        local bc = ""
+        if ctx.local_vars then
+            for v in pairs(ctx.local_vars) do
+                bc = bc..("        free_value(%s);\n"):format(v)
+            end
+        end
+        return bc
+    end
+
+    local bi = 1
+    while bi <= #for_body do local st,c2=gen_stmt(for_body,bi,ctx); code=code..st; bi=bi+c2 end
+
+    ctx.break_flag = prev_bflag
+    ctx.break_cleanup = prev_bcleanup
+
+    local lvars = {ivar}; if vvar then lvars[#lvars+1]=vvar end
+    local cleanup = loop_restore(ctx, saved_lv, saved_am, before, lvars, "        ")
+    code = code..cleanup
+    code = code..("        free_value(%s);\n"):format(ivar)
+    if vvar then code=code..("        free_value(%s);\n"):format(vvar) end
+    code = code..("        if(%s)break;\n"):format(bflag)
+    code = code.."    }\n"
+    code = code..("    free_value(%s);\n"):format(tbl_tmp)
+    return code
+end
+
+local function gen_for(s, ctx, idx, src)
+    -- numeric for
+    local var,se,le,ste = s:match("^for%s+([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.-)%s*,%s*(.-)%s*,%s*(.-)%s+do$")
+    if not var then var,se,le = s:match("^for%s+([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.-)%s*,%s*(.-)%s+do$") end
+    if var then
+        local for_body, consumed = collect_block(src, idx+1)
+        local sv,lv,stv = newtmp(), newtmp(), newtmp()
+        local code = ("    Value %s=%s;\n    Value %s=%s;\n    Value %s=%s;\n"):format(
+            sv,translate_expr(se), lv,translate_expr(le), stv, ste and translate_expr(ste) or "make_int(1)")
+
+        -- float branch
+        code = code..("    if(%s.t==T_DOUBLE||%s.t==T_DOUBLE||%s.t==T_DOUBLE){\n"):format(sv,lv,stv)
+        code = code..("        if(numval(%s)==0.0){free_value(%s);free_value(%s);free_value(%s);lua_runtime_error(\"'for' step is zero\");}\n"):format(stv,sv,lv,stv)
+        code = code..("        double __fs_%s=numval(%s),__fl_%s=numval(%s),__fst_%s=numval(%s);\n"):format(var,sv,var,lv,var,stv)
+        code = code..("        for(double __fd_%s=__fs_%s;(__fst_%s>=0?__fd_%s<=__fl_%s:__fd_%s>=__fl_%s);__fd_%s+=__fst_%s){\n"):format(var,var,var,var,var,var,var,var,var)
+        -- FIX-B1: emit loop var then check break flag at bottom; break frees var first
+        code = code..("            Value %s=make_double(__fd_%s);\n"):format(var,var)
+        local saved_lv2,saved_am2,before2 = loop_save(ctx)
+        local prev_bflag2 = ctx.break_flag
+        local prev_bclean2 = ctx.break_cleanup
+        local bflag2 = newtmp()
+        code = code..("            int %s=0;\n"):format(bflag2)
+        ctx.break_flag = bflag2
+        ctx.break_cleanup = function()
+            local bc = ("            free_value(%s);\n"):format(var)
+            if ctx.local_vars then
+                for v,_ in pairs(ctx.local_vars) do
+                    if v ~= var then bc=bc..("            free_value(%s);\n"):format(v) end
+                end
+            end
+            return bc
+        end
+        local bi2 = 1
+        while bi2 <= #for_body do local st2,c3=gen_stmt(for_body,bi2,ctx); code=code..st2; bi2=bi2+c3 end
+        ctx.break_flag = prev_bflag2
+        ctx.break_cleanup = prev_bclean2
+        local cleanup2 = loop_restore(ctx, saved_lv2, saved_am2, before2, {}, "            ")
+        code = code..cleanup2..("            free_value(%s);\n            if(%s)break;\n        }\n    }else{\n"):format(var,bflag2)
+
+        -- integer branch
+        code = code..("        if(%s.i==0){free_value(%s);free_value(%s);free_value(%s);lua_runtime_error(\"'for' step is zero\");}\n"):format(stv,sv,lv,stv)
+        code = code..("        for(int64_t __i_%s=%s.i;(%s.i>=0?__i_%s<=%s.i:__i_%s>=%s.i);__i_%s+=%s.i){\n"):format(
+            var,sv, stv,var,lv,var,lv,var,stv)
+        code = code..("            Value %s=make_int(__i_%s);\n"):format(var,var)
+
+        local saved_lv,saved_am,before = loop_save(ctx)
+        local prev_bflag = ctx.break_flag
+        local prev_bclean = ctx.break_cleanup
+        local bflag = newtmp()
+        code = code..("            int %s=0;\n"):format(bflag)
+        ctx.break_flag = bflag
+        ctx.break_cleanup = function()
+            local bc = ("            free_value(%s);\n"):format(var)
+            if ctx.local_vars then
+                for v,_ in pairs(ctx.local_vars) do
+                    if v ~= var then bc=bc..("            free_value(%s);\n"):format(v) end
+                end
+            end
+            return bc
+        end
+        local bi = 1
+        while bi <= #for_body do local st,c2=gen_stmt(for_body,bi,ctx); code=code..st; bi=bi+c2 end
+        ctx.break_flag = prev_bflag
+        ctx.break_cleanup = prev_bclean
+
+        local cleanup = loop_restore(ctx, saved_lv, saved_am, before, {}, "            ")
+        return code..cleanup..("            free_value(%s);\n            if(%s)break;\n        }\n    }\n"):format(var,bflag)
+            ..("    free_value(%s);free_value(%s);free_value(%s);\n"):format(sv,lv,stv), 1+consumed
+    end
+
+    -- generic for
+    local vars_str, iter_expr = s:match("^for%s+(.-)%s+in%s+(.-)%s+do$")
+    if vars_str and iter_expr then
+        iter_expr = trim(iter_expr)
+        local vars = split_args(vars_str)
+        local for_body, consumed = collect_block(src, idx+1)
+
+        do local gm_self, gm_pat = iter_expr:match("^(.-)%s*:%s*gmatch%s*%((.+)%)$")
+            if gm_self and gm_pat then
+                local self_t = translate_expr(trim(gm_self))
+                local pat_t  = translate_expr(trim(gm_pat))
+                local _,call = build_array_call("lua_string_gmatch", {self_t, pat_t})
+                return gen_ipairs_loop(call, vars, for_body, ctx), 1+consumed
+            end end
+
+        local ipairs_inner = iter_expr:match("^ipairs%s*%((.+)%)$")
+        local gmatch_inner = iter_expr:match("^string%.gmatch%s*%((.+)%)$")
+        if ipairs_inner then
+            return gen_ipairs_loop(translate_expr(ipairs_inner), vars, for_body, ctx), 1+consumed
+        end
+        if gmatch_inner then
+            local gargs = split_args(gmatch_inner); local ga = {}
+            for _,a in ipairs(gargs) do table.insert(ga, translate_expr(trim(a))) end
+            local _,call = build_array_call("lua_string_gmatch", ga)
+            return gen_ipairs_loop(call, vars, for_body, ctx), 1+consumed
+        end
+
+        -- pairs
+        local pairs_inner = iter_expr:match("^pairs%s*%((.+)%)$")
+        if pairs_inner then
+            local tbl_tmp = newtmp()
+            local kvar = vars[1] or "_"
+            local vvar = vars[2]
+            local pidx = newtmp()
+            local bflag = newtmp()   -- FIX-B9: break flag for pairs loop
+            local code = ("    Value %s=%s;\n"):format(tbl_tmp, translate_expr(pairs_inner))
+            code = code..("    if(%s.t==T_TABLE&&%s.tbl){\n"):format(tbl_tmp, tbl_tmp)
+            code = code..("    for(int %s=0;%s<%s.tbl->cap;%s++){\n"):format(pidx,pidx,tbl_tmp,pidx)
+            code = code..("        int %s=0;\n"):format(bflag)
+            code = code..("        if(!%s.tbl->entries[%s].used)continue;\n"):format(tbl_tmp,pidx)
+            code = code..("        Value %s=value_copy(%s.tbl->entries[%s].key);\n"):format(kvar,tbl_tmp,pidx)
+            if vvar then
+                code = code..("        Value %s=value_copy(%s.tbl->entries[%s].val);\n"):format(vvar,tbl_tmp,pidx)
+            end
+
+            local saved_lv, saved_am, before = loop_save(ctx)
+            if ctx.local_vars then
+                ctx.local_vars[kvar]=true; if vvar then ctx.local_vars[vvar]=true end
+            end
+            local prev_bflag = ctx.break_flag
+            local prev_bclean = ctx.break_cleanup
+            ctx.break_flag = bflag
+            ctx.break_cleanup = function()
+                local bc = ""
+                if ctx.local_vars then
+                    for v,_ in pairs(ctx.local_vars) do
+                        bc = bc..("        free_value(%s);\n"):format(v)
+                    end
+                end
+                return bc
+            end
+
+            local bi = 1
+            while bi <= #for_body do local st,c2=gen_stmt(for_body,bi,ctx); code=code..st; bi=bi+c2 end
+
+            ctx.break_flag = prev_bflag
+            ctx.break_cleanup = prev_bclean
+
+            local lvars = {kvar}; if vvar then lvars[#lvars+1]=vvar end
+            local cleanup = loop_restore(ctx, saved_lv, saved_am, before, lvars, "        ")
+            code = code..cleanup
+            code = code..("        free_value(%s);\n"):format(kvar)
+            if vvar then code=code..("        free_value(%s);\n"):format(vvar) end
+            code = code..("        if(%s)break;\n"):format(bflag)
+            code = code.."    }\n    }\n"
+            code = code..("    free_value(%s);\n"):format(tbl_tmp)
+            return code, 1+consumed
+        end
+    end
+    return nil
 end
 
 local function try_table_assign(s)
-    local tbl,key,rhs=s:match("^([A-Za-z_][A-Za-z0-9_]*)%.([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.+)$")
-    if tbl then return("    table_set(value_copy(%s),make_string(\"%s\"),%s);\n"):format(tbl,escape_c(key),translate_expr(rhs)) end
-    local t2,k2,r2=s:match("^([A-Za-z_][A-Za-z0-9_]*)%[(.+)%]%s*=%s*(.+)$")
-    if t2 then return("    table_set(value_copy(%s),%s,%s);\n"):format(t2,translate_expr(k2),translate_expr(r2)) end
+    local tbl,key,rhs = s:match("^([A-Za-z_][A-Za-z0-9_]*)%.([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.+)$")
+    if tbl then
+        return ("    table_set(value_copy(%s),make_string(\"%s\"),%s);\n"):format(tbl,escape_c(key),translate_expr(rhs))
+    end
+    local t2,k2,r2 = s:match("^([A-Za-z_][A-Za-z0-9_]*)%[(.+)%]%s*=%s*(.+)$")
+    if t2 then
+        return ("    table_set(value_copy(%s),%s,%s);\n"):format(t2,translate_expr(k2),translate_expr(r2))
+    end
 end
 
--- ctx fields: is_top, local_vars (nil if top), assigned, globals_tbl
-gen_stmt=function(src,idx,ctx)
-    local s=trim(src[idx]or""); if s=="" then return "",1 end
-    local lv=ctx.local_vars; local am=ctx.assigned; local gt=ctx.globals_tbl
+local function is_call_expr(e)
+    e = trim(e); if e:sub(-1)~=')' then return false end; return e:find("%(") ~= nil
+end
+
+local function is_single_call(e)
+    e = trim(e)
+    if not e:match("%(") or e:sub(-1)~=')' then return false end
+    local found = false
+    depth_scan(e, function(_,ch) if ch==',' then found=true; return true end end)
+    return not found
+end
+
+gen_stmt = function(src, idx, ctx)
+    local s = trim(src[idx] or ""); if s=="" then return "",1 end
+    local lv = ctx.local_vars; local am = ctx.assigned; local gt = ctx.globals_tbl
+
+    if s:match("^%-%-") then return "",1 end
+
+    -- FIX-B1/B8: break now frees loop locals and sets break flag if inside loop
+    if s == "break" then
+        if ctx.break_flag then
+            -- emit cleanup via ctx.break_cleanup, then set flag
+            local cleanup = ctx.break_cleanup and ctx.break_cleanup() or ""
+            return cleanup..("    %s=1;\n    break;\n"):format(ctx.break_flag), 1
+        end
+        return "    break;\n",1
+    end
+
+    if s:match("^local%s+function%s") or (s:match("^function%s") and lv) then
+        local fn_pos = s:find("function%s")
+        local op2 = fn_pos and s:find("%(", fn_pos)
+        if op2 then
+            local pd,pi=0,op2
+            while pi<=#s do local pc=s:sub(pi,pi)
+                if pc=='(' then pd=pd+1 elseif pc==')' then pd=pd-1; if pd==0 then break end end; pi=pi+1 end
+            local after=trim(s:sub(pi+1))
+            if after:match("^(.-)%s*end$") then return "    /* nested fn skipped */\n",1 end
+        end
+        local _,consumed = collect_block(src, idx+1)
+        return "    /* nested fn skipped */\n", 1+consumed
+    end
+
+    -- while
+    local wcond = s:match("^while%s+(.-)%s+do$")
+    if wcond then
+        local while_body, consumed = collect_block(src, idx+1)
+        local tmp,cv = newtmp(), newtmp()
+        local bflag = newtmp()   -- FIX-B8: break flag for while
+        local code = ("    while(1){\n        int %s=0;\n        Value %s=%s;\n        int %s=value_is_truthy(%s);\n        free_value(%s);\n        if(!%s)break;\n"):format(
+            bflag, tmp, translate_expr(wcond), cv, tmp, tmp, cv)
+        local saved_lv,saved_am,before = loop_save(ctx)
+        local prev_bflag = ctx.break_flag
+        local prev_bclean = ctx.break_cleanup
+        ctx.break_flag = bflag
+        ctx.break_cleanup = function()
+            local bc = ""
+            if ctx.local_vars then
+                for v,_ in pairs(ctx.local_vars) do
+                    bc = bc..("        free_value(%s);\n"):format(v)
+                end
+            end
+            return bc
+        end
+        local bi=1
+        while bi<=#while_body do local st,c2=gen_stmt(while_body,bi,ctx); code=code..st; bi=bi+c2 end
+        ctx.break_flag = prev_bflag
+        ctx.break_cleanup = prev_bclean
+        local cleanup = loop_restore(ctx, saved_lv, saved_am, before, {}, "        ")
+        return code..cleanup.."    }\n", 1+consumed
+    end
+
+    if s == "do" then
+        local do_body, consumed = collect_block(src, idx+1)
+        local code = "    {\n"
+        local saved_lv,saved_am,before = loop_save(ctx)
+        local bi=1
+        while bi<=#do_body do local st,c2=gen_stmt(do_body,bi,ctx); code=code..st; bi=bi+c2 end
+        local cleanup = loop_restore(ctx, saved_lv, saved_am, before, {}, "    ")
+        return code..cleanup.."    }\n", 1+consumed
+    end
+
+    -- repeat..until
+    if s == "repeat" then
+        local rep_body,rep_j = {}, idx+1; local dr=1
+        while rep_j <= #src do
+            local RL = trim(src[rep_j])
+            if opens_block(RL) then dr=dr+1 end
+            if RL:match("^until%s") and dr==1 then break end
+            if RL=="end" then dr=dr-1 end
+            table.insert(rep_body, src[rep_j]); rep_j=rep_j+1
+        end
+        local ucond = trim(src[rep_j] or ""):match("^until%s+(.+)$") or "false"
+        local bflag = newtmp()   -- FIX-B10: break flag for repeat
+        local code = ("    int %s=0;\n    do{\n"):format(bflag)
+        local saved_lv,saved_am,before = loop_save(ctx)
+        local prev_bflag = ctx.break_flag
+        local prev_bclean = ctx.break_cleanup
+        ctx.break_flag = bflag
+        ctx.break_cleanup = function()
+            local bc = ""
+            if ctx.local_vars then
+                for v,_ in pairs(ctx.local_vars) do
+                    bc = bc..("        free_value(%s);\n"):format(v)
+                end
+            end
+            return bc
+        end
+        local bi=1
+        while bi<=#rep_body do local st,c2=gen_stmt(rep_body,bi,ctx); code=code..st; bi=bi+c2 end
+        ctx.break_flag = prev_bflag
+        ctx.break_cleanup = prev_bclean
+        local cleanup = loop_restore(ctx, saved_lv, saved_am, before, {}, "    ")
+        local tmp,cv = newtmp(), newtmp()
+        code = code..cleanup
+        code = code..("        if(%s)break;\n"):format(bflag)
+        code = code..("        Value %s=%s;\n        int %s=value_is_truthy(%s);\n        free_value(%s);\n        if(%s)break;\n"):format(
+            tmp, translate_expr(ucond), cv, tmp, tmp, cv)
+        return code.."    }while(1);\n", (rep_j-idx+1)
+    end
 
     -- return
-    if s=="return" then
-        local cleanup=emit_scope_cleanup(ctx)
-        if lv then
-            return cleanup.."    return make_nil();\n",1
-        end
-        return cleanup.."    return make_nil();\n",1
+    if s == "return" then
+        local cleanup = emit_scope_cleanup(ctx)
+        ctx.returned = true
+        return cleanup.."    __retncount=0;\n    return make_nil();\n", 1
     end
-    local ret=s:match("^return%s+(.+)$")
+    local ret = s:match("^return%s+(.+)$")
     if ret then
-        local cleanup=emit_scope_cleanup(ctx)
-        if lv then
-            local tmp=newtmp()
-            -- Evaluate the return expression BEFORE freeing locals
-            local code=("    Value %s=%s;\n"):format(tmp,translate_expr(ret))
-            code=code..cleanup
-            return code..("    return %s;\n"):format(tmp),1
+        local retvals = split_args(ret)
+        local code = ""
+        local tmps = {}
+
+        if #retvals==1 and is_single_call(trim(retvals[1])) then
+            local tmp = newtmp()
+            -- value_call is self-contained: after it returns, __retncount and
+            -- __retbuf[1..] already hold the callee's secondary returns.
+            -- Just return the primary; the caller frame sees everything correctly.
+            code = ("    Value %s=%s;\n"):format(tmp, translate_expr(trim(retvals[1])))
+            local cleanup = emit_scope_cleanup(ctx)
+            ctx.returned = true
+            return code..cleanup..("    return %s;\n"):format(tmp), 1
         end
-        return cleanup.."    return "..translate_expr(ret)..";\n",1
+
+        for ri,rv in ipairs(retvals) do
+            local tmp = newtmp()
+            code = code..("    Value %s=%s;\n"):format(tmp, translate_expr(trim(rv)))
+            tmps[ri] = tmp
+        end
+        local cleanup = emit_scope_cleanup(ctx)
+        ctx.returned = true
+        code = code..cleanup
+        code = code..("    __retncount=%d;\n"):format(#tmps)
+        for ri,tmp in ipairs(tmps) do
+            if ri==1 then code=code..("    __retbuf[0]=%s;\n"):format(tmp)
+            else code=code..("    if(%d<__retbuf_cap)__retbuf[%d]=%s;else free_value(%s);\n"):format(ri-1,ri-1,tmp,tmp) end
+        end
+        if #tmps==0 then return code.."    return make_nil();\n",1 end
+        return code.."    return __retbuf[0];\n",1
     end
 
-    -- assert statement
     if s:match("^assert%s*%(") then return gen_assert_stmt(s),1 end
 
-    -- local var decl
-    local lname,rhs=s:match("^local%s+([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.+)$")
+    -- local multi-var
+    do local rest_loc = s:match("^local%s+(.+)$")
+        if rest_loc then
+            local eq_idx
+            for ci=1,#rest_loc do
+                local cc=rest_loc:sub(ci,ci)
+                if cc=='=' then
+                    local prev=rest_loc:sub(ci-1,ci-1)
+                    if prev~='=' and prev~='<' and prev~='>' and prev~='~' then
+                        local nxt=rest_loc:sub(ci+1,ci+1)
+                        if nxt~='=' then eq_idx=ci; break end
+                    end
+                end
+            end
+            local var_part = trim(eq_idx and rest_loc:sub(1,eq_idx-1) or rest_loc)
+            local rhs_part = eq_idx and trim(rest_loc:sub(eq_idx+1)) or nil
+            if var_part:find(",") then
+                local vlist = split_args(var_part); local code = ""
+                if rhs_part and is_call_expr(rhs_part) and not rhs_part:find(",") then
+                    local first_tmp = newtmp()
+                    code = code..("    Value %s=%s;\n"):format(first_tmp, translate_expr(rhs_part))
+                    for vi,vname in ipairs(vlist) do
+                        vname = trim(vname); if #vname==0 then goto cont end
+                        -- FIX-B5: always value_copy from retbuf slots
+                        local rval = vi==1 and first_tmp
+                            or ("(__retncount>%d?value_copy(__retbuf[%d]):make_nil())"):format(vi-1,vi-1)
+                        if lv then lv[vname]=true; code=code..("    Value %s=%s;\n"):format(vname,rval)
+                        else gt[vname]=true; am[vname]=true; code=code..("    free_value(%s);\n    %s=%s;\n"):format(vname,vname,rval) end
+                        ::cont::
+                    end
+                else
+                    for vi,vname in ipairs(vlist) do
+                        vname=trim(vname); if #vname==0 then goto cont end
+                        local val = (vi==1 and rhs_part) and translate_expr(rhs_part) or "make_nil()"
+                        if lv then lv[vname]=true; code=code..("    Value %s=%s;\n"):format(vname,val)
+                        else gt[vname]=true; am[vname]=true; code=code..("    free_value(%s);\n    %s=%s;\n"):format(vname,vname,val) end
+                        ::cont::
+                    end
+                end
+                return code,1
+            end
+        end end
+
+    local lname, rhs = s:match("^local%s+([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.+)$")
     if lname and rhs then
-        if lv then lv[lname]=true; return("    Value %s=%s;\n"):format(lname,translate_expr(rhs)),1 end
-        gt[lname]=true;am[lname]=true
-        return("    free_value(%s);\n    %s=%s;\n"):format(lname,lname,translate_expr(rhs)),1
+        if lv then
+            lv[lname]=true
+            return ("    Value %s=%s;\n"):format(lname,translate_expr(rhs)),1
+        end
+        gt[lname]=true; am[lname]=true
+        return ("    free_value(%s);\n    %s=%s;\n"):format(lname,lname,translate_expr(rhs)),1
     end
-    local lname2=s:match("^local%s+([A-Za-z_][A-Za-z0-9_]*)$")
+    local lname2 = s:match("^local%s+([A-Za-z_][A-Za-z0-9_]*)$")
     if lname2 then
-        if lv then lv[lname2]=true; return("    Value %s=make_nil();\n"):format(lname2),1 end
-        gt[lname2]=true;am[lname2]=true;return "",1
+        if lv then lv[lname2]=true; return ("    Value %s=make_nil();\n"):format(lname2),1 end
+        gt[lname2]=true; am[lname2]=true; return "",1
     end
 
-    -- print
-    local pargs=s:match("^print%s*%((.*)%)$")
+    local pargs = s:match("^print%s*%((.*)%)$")
     if pargs then return gen_print(pargs),1 end
 
-    -- table assign
-    local ta=try_table_assign(s); if ta then return ta,1 end
+    local ta = try_table_assign(s); if ta then return ta,1 end
 
-    -- assignment
-    local var,rhs2=s:match("^([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.+)$")
+    -- multi-var assignment
+    do local mavar = s:match("^([A-Za-z_][A-Za-z0-9_]*%s*,.-[A-Za-z_][A-Za-z0-9_]*)%s*=%s*")
+        if mavar then
+            local marhs = s:match("^[A-Za-z_][A-Za-z0-9_]*%s*,.-[A-Za-z_][A-Za-z0-9_]*%s*=%s*(.+)$")
+            if marhs then
+                local vlist = split_args(mavar); local code = ""
+                if is_call_expr(marhs) and not marhs:find(",") then
+                    local first_tmp = newtmp()
+                    code = code..("    Value %s=%s;\n"):format(first_tmp, translate_expr(marhs))
+                    for vi,vn in ipairs(vlist) do
+                        vn = trim(vn); if vn=="" then goto cont end
+                        -- FIX-B5: always value_copy from retbuf
+                        local rval = vi==1 and first_tmp
+                            or ("(__retncount>%d?value_copy(__retbuf[%d]):make_nil())"):format(vi-1,vi-1)
+                        code = code..("    free_value(%s);\n    %s=%s;\n"):format(vn,vn,rval)
+                        am[vn] = true
+                        ::cont::
+                    end
+                else
+                    local tmp2 = newtmp()
+                    code = ("    Value %s=%s;\n"):format(tmp2, translate_expr(marhs))
+                    local first_v = trim(vlist[1] or "")
+                    if first_v ~= "" then
+                        code=code..("    free_value(%s);\n    %s=%s;\n"):format(first_v,first_v,tmp2); am[first_v]=true
+                    else code=code..("    free_value(%s);\n"):format(tmp2) end
+                    for vi2=2,#vlist do
+                        local vn2=trim(vlist[vi2])
+                        if vn2~="" then
+                            code=code..("    free_value(%s);\n    %s=make_nil();\n"):format(vn2,vn2); am[vn2]=true
+                        end
+                    end
+                end
+                return code,1
+            end
+        end end
+
+    local var, rhs2 = s:match("^([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.+)$")
     if var and rhs2 then
-        am[var]=true
+        am[var] = true
         if lv and not lv[var] and not gt[var] then
-            lv[var]=true; return("    Value %s=%s;\n"):format(var,translate_expr(rhs2)),1
+            lv[var]=true
+            return ("    Value %s=%s;\n"):format(var,translate_expr(rhs2)),1
         end
-        local tmp=newtmp()
-        return("    Value %s=%s;\n    free_value(%s);\n    %s=%s;\n"):format(tmp,translate_expr(rhs2),var,var,tmp),1
+        local tmp = newtmp()
+        return ("    Value %s=%s;\n    free_value(%s);\n    %s=%s;\n"):format(tmp,translate_expr(rhs2),var,var,tmp),1
     end
 
-    -- if
-    if s:match("^if%s") then return gen_if(s,ctx,idx,src) end
+    if s:match("^if%s") then return gen_if(s, ctx, idx, src) end
 
-    -- for
-    do local fc,consumed=gen_for(s,ctx,idx,src); if fc then return fc,consumed end end
+    do local fc,consumed = gen_for(s, ctx, idx, src); if fc then return fc,consumed end end
 
-    -- expression statement (call etc)
-    if s:match("%(")or s:match("%[")or s:match("%.") then
-        local tmp=newtmp()
-        return("    Value %s=%s;\n    free_value(%s);\n"):format(tmp,translate_expr(s),tmp),1
+    if s:match("%(") or s:match("%[") or s:match("%.") then
+        local tmp = newtmp()
+        return ("    Value %s=%s;\n    free_value(%s);\n"):format(tmp,translate_expr(s),tmp),1
     end
 
-    return "    /* unsupported: "..s.." */\n",1
+    return "    /* unsupported: "..s:gsub("/%*","/ *"):gsub("%*/","* /").." */\n",1
 end
 
 -- ---------------------------------------------------------------------------
 -- Usage analysis
 -- ---------------------------------------------------------------------------
-local all_source=table.concat(lines,"\n")
-local function src_uses(pat) return all_source:find(pat)~=nil end
+local all_source = table.concat(lines,"\n")
+local function src_uses(pat) return all_source:find(pat) ~= nil end
 
-local use={}
-local U={
-    print="print%s*%(",value_len="#[%w_%(\"]",value_concat="%.%.",
-    value_add="[%w_%)\"]%s*%+",value_sub="[%w_%)\"]%s*%-[^%-]",
-    value_mul="%*",value_div="[^/]/[^/]",value_mod="[%w_%)\"]%s*%%[^%%]",
-    value_eq="==",value_neq="~=",value_lt="[^<]<[^=<]",value_gt="[^>]>[^=>]",
-    value_le="<=",value_ge=">=",
-    value_and="[%)%w_\"]%s+and%s",value_or="[%)%w_\"]%s+or%s",
-    value_not="[%(,%s]not%s",table_init="{",table_ops="%.[%a_][%w_]*",
-    method_call=":[A-Za-z_]",assert="assert%s*%(",error="error%s*%(",
+local use = {}
+local U = {
+    print="print%s*%(", value_len="#[%w_%(\"]", value_concat="%.%.",
+    value_add="[%w_%)\"]%s*%+", value_sub="[%w_%)\"]%s*%-[^%-]",
+    value_mul="%*", value_div="[^/]/[^/]", value_mod="[%w_%)\"]%s*%%[^%%]",
+    value_pow="%^",
+    value_eq="==", value_neq="~=", value_lt="[^<]<[^=<]", value_gt="[^>]>[^=>]",
+    value_le="<=", value_ge=">=",
+    value_and="[%)%w_\"]%s+and%s", value_or="[%)%w_\"]%s+or%s",
+    value_not="[%(,%s]not%s", table_init="{", table_ops="%.[%a_][%w_]*",
+    method_call=":[A-Za-z_]", assert="assert%s*%(", error="error%s*%(",
+    use_ipairs="ipairs%s*%(", use_pairs="pairs%s*%(", use_arg="%barg%s*%[",
+    use_string="string%s*%.", use_str_method=":[a-z]",
+    use_tostring="tostring%s*%(", use_tonumber="tonumber%s*%(", use_type="type%s*%(",
+    use_select="select%s*%(", use_vararg="%.",
 }
 for k,p in pairs(U) do use[k]=src_uses(p) end
-use.value_add=use.value_add or src_uses("%+%s*[%w_%(\"']")
-use.value_lt=use.value_lt or src_uses("^<[^=]")
-use.value_gt=use.value_gt or src_uses("^>[^=]")
-use.value_and=use.value_and or src_uses("%sand%s+[%(]")
-use.value_or=use.value_or or src_uses("%sor%s+[%(]")
-use.value_not=use.value_not or src_uses("^not%s")
-use.table_ops=use.table_ops or src_uses("%[")
+use.use_vararg = src_uses("%.%.%.")
+use.value_add  = use.value_add  or src_uses("%+%s*[%w_%(\"']")
+use.value_lt   = use.value_lt   or src_uses("^<[^=]")
+use.value_gt   = use.value_gt   or src_uses("^>[^=]")
+use.value_and  = use.value_and  or src_uses("%sand%s+[%(]")
+use.value_or   = use.value_or   or src_uses("%sor%s+[%(]")
+use.value_not  = use.value_not  or src_uses("^not%s")
+use.table_ops  = use.table_ops  or src_uses("%[")
+if use.use_ipairs or use.use_pairs then use.table_ops=true; use.table_init=true end
+use.use_arg = use.use_arg or src_uses("arg%s*%.")
+if use.use_arg then use.table_ops=true end
 
-local math_fns={"abs","floor","ceil","sqrt","sin","cos","tan","asin","acos","atan","atan2",
+local str_fns = {"find","match","gmatch","gsub","sub","len","format","rep","reverse","upper","lower","byte","char"}
+local used_str = {}
+for _,fn in ipairs(str_fns) do
+    used_str[fn] = src_uses("string%s*%.%s*"..fn) or src_uses(":"..fn.."%s*%(")
+end
+use.string_lib = false
+for _,fn in ipairs(str_fns) do if used_str[fn] then use.string_lib=true end end
+if src_uses(":gmatch%s*%(") then use.string_lib=true; used_str.gmatch=true end
+use.use_select = use.use_select or src_uses("select%s*%(")
+
+local math_fns = {"abs","floor","ceil","sqrt","sin","cos","tan","asin","acos","atan","atan2",
     "exp","log","log10","sinh","cosh","tanh","deg","rad","pow","fmod","modf","frexp","ldexp","max","min","random","randomseed"}
-local used_math={}
+local used_math = {}
 for _,fn in ipairs(math_fns) do used_math[fn]=src_uses("math%s*%.%s*"..fn) end
-local use_math_pi=src_uses("math%s*%.%s*pi"); local use_math_huge=src_uses("math%s*%.%s*huge")
+local use_math_pi   = src_uses("math%s*%.%s*pi")
+local use_math_huge = src_uses("math%s*%.%s*huge")
 
-local os_fns={"clock","time","difftime","date","exit","getenv","execute","remove","rename","tmpname","setlocale"}
-local used_os={}
+local os_fns = {"clock","time","difftime","date","exit","getenv","execute","remove","rename","tmpname","setlocale"}
+local used_os = {}
 for _,fn in ipairs(os_fns) do used_os[fn]=src_uses("os%s*%.%s*"..fn) end
 
-local io_fns={"write","read","lines","open","close","flush","stdin","stdout","stderr"}
-local used_io={}
+local io_fns = {"write","read","lines","open","close","flush","stdin","stdout","stderr"}
+local used_io = {}
 for _,fn in ipairs(io_fns) do used_io[fn]=src_uses("io%s*%.%s*"..fn) end
 
 if use.value_neq or use.value_le or use.value_ge then use.value_eq=true end
-if use.value_le or use.value_ge then use.value_lt=true end
-if use.value_gt then use.value_lt=true end
+if use.value_le  or use.value_ge then use.value_lt=true end
+if use.value_gt  then use.value_lt=true end
 
-use.math_lib=use_math_pi or use_math_huge
+use.math_lib = use_math_pi or use_math_huge
 for _,fn in ipairs(math_fns) do if used_math[fn] then use.math_lib=true end end
-use.os_lib=false; for _,fn in ipairs(os_fns) do if used_os[fn] then use.os_lib=true end end
-use.io_lib=false; for _,fn in ipairs(io_fns) do if used_io[fn] then use.io_lib=true end end
-use.prng=used_math.random or used_math.randomseed
+use.os_lib = false; for _,fn in ipairs(os_fns)  do if used_os[fn]   then use.os_lib=true  end end
+use.io_lib = false; for _,fn in ipairs(io_fns)  do if used_io[fn]   then use.io_lib=true  end end
+use.prng   = used_math.random or used_math.randomseed
 
-use.numval=use.value_add or use.value_sub or use.value_mul or use.value_div
-    or use.value_mod or use.value_lt or use.value_gt or use.value_le or use.value_ge or use.value_concat
+use.numval = use.value_add or use.value_sub or use.value_mul or use.value_div
+    or use.value_mod or use.value_pow or use.value_lt or use.value_gt or use.value_le or use.value_ge or use.value_concat
 if use.math_lib then use.numval=true end
 if used_os.difftime or used_os.exit or used_os.date then use.numval=true end
-use.math_h=use.math_lib or use.value_mod
-use.time_h=use.prng or use.os_lib
-if used_io.open then use.file_methods=true;use.method_call=true end
+use.math_h  = use.math_lib or use.value_mod or use.value_pow or use.string_lib
+use.time_h  = use.prng     or use.os_lib
+if used_io.open    then use.file_methods=true; use.method_call=true end
 if use.method_call then use.table_ops=true end
-use.value_call=use.table_ops
+if use.use_str_method or use.string_lib then use.table_ops=true end
+use.value_call = true
+use.numval = true  -- numeric for float branch always needs numval
 
-local has_tables=use.table_ops or use.table_init or use.math_lib or use.os_lib or use.io_lib
+local has_tables = true
 
 -- ---------------------------------------------------------------------------
 -- Emit C
 -- ---------------------------------------------------------------------------
-local out={}
-local function w(s) table.insert(out,s) end
+local out = {}
+local function w(s)   table.insert(out, s) end
 local function wif(c,s) if c then w(s) end end
 
 w("#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdint.h>\n#include <stdarg.h>")
-wif(use.math_h,"#include <math.h>")
-wif(use.time_h,"#include <time.h>")
+wif(use.math_h,  "#include <math.h>")
+wif(use.time_h,  "#include <time.h>")
+wif(use.string_lib, "#include <ctype.h>")
 if used_os.getenv or used_os.execute or used_os.remove or used_os.rename or used_os.tmpname or used_os.setlocale then
     w("#include <errno.h>\n#include <locale.h>") end
 w("")
+
 w([[/* Value type */
 typedef enum{T_INT,T_DOUBLE,T_STRING,T_BOOL,T_NIL,T_TABLE,T_FUNC,T_FILE}Type;
 typedef struct LuaStr{int refcount;uint32_t hash;char data[];}LuaStr;
@@ -684,26 +1345,172 @@ static inline void luastr_decref(LuaStr*ls){if(ls&&--ls->refcount<=0)free(ls);}
 static inline const char*luastr_cstr(const LuaStr*ls){return ls?ls->data:"";}
 static uint32_t luastr_hash(LuaStr*ls){if(!ls)return 0;if(ls->hash)return ls->hash;uint32_t h=2166136261u;for(const char*p=ls->data;*p;p++){h^=(uint8_t)*p;h*=16777619u;}if(!h)h=1;ls->hash=h;return h;}]])
 
-if has_tables then w([[
-typedef struct TableEntry{Value key;Value val;int used;}TableEntry;
-typedef struct Table{TableEntry*entries;int cap;int len;int refcount;}Table;
-#define TBL_INIT_CAP 8
-static uint32_t hash_value(Value k){switch(k.t){case T_INT:return(uint32_t)(k.i*2654435761ULL);case T_DOUBLE:{if(k.d==0.0)return 0;uint64_t u;memcpy(&u,&k.d,8);return(uint32_t)(u^(u>>32))*2654435761u;}case T_STRING:return luastr_hash(k.ls);case T_BOOL:return(uint32_t)k.i^0xdeadbeef;default:return 0;}}
-static int keys_equal(Value a,Value b){if(a.t!=b.t){if((a.t==T_INT||a.t==T_DOUBLE)&&(b.t==T_INT||b.t==T_DOUBLE)){double da=a.t==T_DOUBLE?a.d:(double)a.i,db=b.t==T_DOUBLE?b.d:(double)b.i;return da==db;}return 0;}switch(a.t){case T_INT:return a.i==b.i;case T_DOUBLE:return a.d==b.d;case T_BOOL:return a.i==b.i;case T_NIL:return 1;case T_STRING:return a.ls==b.ls||strcmp(luastr_cstr(a.ls),luastr_cstr(b.ls))==0;case T_TABLE:return a.tbl==b.tbl;default:return 0;}}]]) end
-
+-- Forward declarations must come before retslot_save/restore because those inline
+-- functions call lua_runtime_error and free_value.
 w([[
 static void free_value(Value v);
 static Value value_copy(Value v);
-static int value_is_truthy(Value v);]])
+static int value_is_truthy(Value v);
+static void lua_runtime_error(const char*fmt,...){
+    va_list ap;va_start(ap,fmt);
+    fprintf(stderr,"runtime error: ");
+    vfprintf(stderr,fmt,ap);
+    fprintf(stderr,"\n");
+    va_end(ap);
+    abort();
+}
+#if defined(__GNUC__)||defined(__clang__)
+#define LUA_UNREACHABLE() __builtin_unreachable()
+#else
+#define LUA_UNREACHABLE() do{}while(0)
+#endif
+]])
+
+w([[
+/* Multi-return buffer (Option-A: self-contained per call).
+ *
+ * Design: every value_call/table_call/value_method_call:
+ *   1. Saves caller's __retncount + secondary __retbuf[1..] into a stack slot.
+ *   2. Resets __retncount=0 so the callee writes into a clean buffer.
+ *   3. Calls the function.
+ *   4. Saves the callee's secondary returns into the stack slot.
+ *   5. Restores the caller's __retncount and secondary __retbuf[1..].
+ *   6. Places the callee's secondaries back into __retbuf[1..] for the
+ *      caller to read, then returns the primary.
+ *
+ * Result: call sites need ZERO push/pop bookkeeping.  Nested calls are safe
+ * because each call fully completes steps 1-6 before the parent reads retbuf.
+ */
+#define RETBUF_CAP 32
+static Value  __retbuf_storage[RETBUF_CAP];
+static Value* __retbuf     = __retbuf_storage;
+static int    __retbuf_cap = RETBUF_CAP;
+static int    __retncount  = 0;
+
+/* Internal save/restore slot stack for nested calls */
+#define RETSLOT_MAX 64
+typedef struct{Value sec[RETBUF_CAP];int cnt;}RetSlot;
+static RetSlot __retslots[RETSLOT_MAX];
+static int     __retslot_top = 0;
+
+static inline void retslot_save(void){
+    if(__retslot_top>=RETSLOT_MAX)lua_runtime_error("call stack overflow");
+    RetSlot*s=&__retslots[__retslot_top++];
+    s->cnt=__retncount;
+    for(int _i=1;_i<__retncount&&_i<RETBUF_CAP;_i++)s->sec[_i]=__retbuf[_i];
+    __retncount=0;
+}
+static inline void retslot_restore(void){
+    if(__retslot_top<=0)return;
+    /* save callee's secondaries before we clobber retbuf */
+    int callee_cnt=__retncount;
+    Value callee_sec[RETBUF_CAP];
+    for(int _i=1;_i<callee_cnt&&_i<RETBUF_CAP;_i++)callee_sec[_i]=__retbuf[_i];
+    /* restore caller's secondaries */
+    RetSlot*s=&__retslots[--__retslot_top];
+    __retncount=s->cnt;
+    for(int _i=1;_i<s->cnt&&_i<RETBUF_CAP;_i++)__retbuf[_i]=s->sec[_i];
+    /* put callee's secondaries back for caller to consume */
+    __retncount=callee_cnt;
+    for(int _i=1;_i<callee_cnt&&_i<RETBUF_CAP;_i++)__retbuf[_i]=callee_sec[_i];
+}
+]])
 
 if has_tables then w([[
-static Table*table_new(void){Table*t=calloc(1,sizeof(Table));t->cap=TBL_INIT_CAP;t->entries=calloc(t->cap,sizeof(TableEntry));t->refcount=1;return t;}
+typedef struct TableEntry{Value key;Value val;int used;}TableEntry;
+/* cap is always a power of two; array_len tracks contiguous integer-key boundary 1..n for # */
+typedef struct Table{TableEntry*entries;int cap;int len;int array_len;int refcount;}Table;
+#define TBL_INIT_CAP 8
+static uint32_t hash_value(Value k){switch(k.t){case T_INT:return(uint32_t)(k.i*2654435761ULL);case T_DOUBLE:{/* FIX-C3: NaN is not a valid key; callers guard before reaching here */if(k.d==0.0)return 0;uint64_t u;memcpy(&u,&k.d,8);return(uint32_t)(u^(u>>32))*2654435761u;}case T_STRING:return luastr_hash(k.ls);case T_BOOL:return(uint32_t)k.i^0xdeadbeef;default:return 0;}}
+static int keys_equal(Value a,Value b){if(a.t!=b.t){if((a.t==T_INT||a.t==T_DOUBLE)&&(b.t==T_INT||b.t==T_DOUBLE)){double da=a.t==T_DOUBLE?a.d:(double)a.i,db=b.t==T_DOUBLE?b.d:(double)b.i;return da==db;}return 0;}switch(a.t){case T_INT:return a.i==b.i;case T_DOUBLE:return a.d==b.d;case T_BOOL:return a.i==b.i;case T_NIL:return 1;case T_STRING:return a.ls==b.ls||strcmp(luastr_cstr(a.ls),luastr_cstr(b.ls))==0;case T_TABLE:return a.tbl==b.tbl;default:return 0;}}]]) end
+
+-- (forward decls and lua_runtime_error already emitted before RetFrame above)
+
+if has_tables then w([[
+static Table*table_new(void){Table*t=calloc(1,sizeof(Table));t->cap=TBL_INIT_CAP;t->entries=calloc(t->cap,sizeof(TableEntry));t->refcount=1;t->array_len=0;return t;}
 static void table_free(Table*t){if(!t||--t->refcount>0)return;for(int i=0;i<t->cap;i++)if(t->entries[i].used){free_value(t->entries[i].key);free_value(t->entries[i].val);}free(t->entries);free(t);}
 static void table_raw_set(Table*t,Value key,Value val);
-static void table_resize(Table*t){int oc=t->cap;TableEntry*old=t->entries;t->cap*=2;t->entries=calloc(t->cap,sizeof(TableEntry));t->len=0;for(int i=0;i<oc;i++)if(old[i].used)table_raw_set(t,old[i].key,old[i].val);free(old);}
-static void table_raw_set(Table*t,Value key,Value val){if(t->len*2>=t->cap)table_resize(t);uint32_t h=hash_value(key);int mask=t->cap-1,idx=(int)(h&mask);while(t->entries[idx].used){if(keys_equal(t->entries[idx].key,key)){free_value(t->entries[idx].key);free_value(t->entries[idx].val);t->entries[idx].key=key;t->entries[idx].val=val;return;}idx=(idx+1)&mask;}t->entries[idx].used=1;t->entries[idx].key=key;t->entries[idx].val=val;t->len++;}
-static void table_set(Value tbl,Value key,Value val){if(tbl.t!=T_TABLE||!tbl.tbl){free_value(tbl);free_value(key);free_value(val);return;}table_raw_set(tbl.tbl,key,val);free_value(tbl);}
-static Value table_get(Value tbl,Value key){if(tbl.t!=T_TABLE||!tbl.tbl){free_value(tbl);free_value(key);return(Value){.t=T_NIL};}Table*t=tbl.tbl;uint32_t h=hash_value(key);int mask=t->cap-1,idx=(int)(h&mask),chk=0;while(t->entries[idx].used&&chk<t->cap){if(keys_equal(t->entries[idx].key,key)){Value r=value_copy(t->entries[idx].val);free_value(tbl);free_value(key);return r;}idx=(idx+1)&mask;chk++;}free_value(tbl);free_value(key);return(Value){.t=T_NIL};}
+static void table_resize(Table*t){
+    int oc=t->cap;TableEntry*old=t->entries;
+    t->cap*=2;t->entries=calloc(t->cap,sizeof(TableEntry));t->len=0;t->array_len=0;
+    for(int i=0;i<oc;i++){
+        if(!old[i].used)continue;
+        table_raw_set(t,old[i].key,old[i].val);
+        old[i].used=0;
+    }
+    free(old);
+}
+static void table_raw_delete(Table*t,Value key){
+    uint32_t h=hash_value(key);int mask=t->cap-1,idx=(int)(h&mask),chk=0;
+    while(t->entries[idx].used&&chk<t->cap){
+        if(keys_equal(t->entries[idx].key,key)){
+            if(key.t==T_INT&&key.i==(int64_t)t->array_len){
+                t->array_len--;
+                while(t->array_len>0){
+                    int64_t ck=(int64_t)t->array_len;
+                    uint32_t ch=(uint32_t)(ck*2654435761ULL);
+                    int ci=(int)(ch&mask),cc=0;int found=0;
+                    while(t->entries[ci].used&&cc<t->cap){
+                        if(t->entries[ci].key.t==T_INT&&t->entries[ci].key.i==ck){found=1;break;}
+                        ci=(ci+1)&mask;cc++;}
+                    if(found)break;
+                    t->array_len--;
+                }
+            }
+            free_value(t->entries[idx].key);free_value(t->entries[idx].val);
+            t->entries[idx].used=0;t->len--;
+            /* FIX-B7: correct canonical backward-shift condition for wrap-around */
+            int prev2=idx;
+            idx=(idx+1)&mask;
+            while(t->entries[idx].used){
+                int nat=(int)(hash_value(t->entries[idx].key)&mask);
+                int should_move=(idx>prev2)?(nat<=prev2||nat>idx):(nat<=prev2&&nat>idx);
+                if(should_move){
+                    t->entries[prev2]=t->entries[idx];
+                    t->entries[idx].used=0;
+                    prev2=idx;}
+                idx=(idx+1)&mask;
+            }
+            free_value(key);return;
+        }
+        idx=(idx+1)&mask;chk++;
+    }
+    free_value(key);
+}
+static void table_raw_set(Table*t,Value key,Value val){
+    if(val.t==T_NIL){free_value(val);table_raw_delete(t,key);return;}
+    /* FIX-C3: NaN keys are disallowed by Lua semantics */
+    if(key.t==T_DOUBLE&&key.d!=key.d){free_value(key);free_value(val);lua_runtime_error("table index is NaN");}
+    if(t->len*2>=t->cap)table_resize(t);
+    uint32_t h=hash_value(key);int mask=t->cap-1,idx=(int)(h&mask);
+    while(t->entries[idx].used){
+        if(keys_equal(t->entries[idx].key,key)){
+            free_value(t->entries[idx].key);free_value(t->entries[idx].val);
+            t->entries[idx].key=key;t->entries[idx].val=val;
+            return;}
+        idx=(idx+1)&mask;}
+    t->entries[idx].used=1;t->entries[idx].key=key;t->entries[idx].val=val;t->len++;
+    /* FIX-B2: update array_len for integral double keys too */
+    int64_t ki=-1;
+    if(key.t==T_INT)ki=key.i;
+    else if(key.t==T_DOUBLE){double d=key.d;if(d>=(double)1&&d<=(double)INT64_MAX&&floor(d)==d)ki=(int64_t)d;}
+    if(ki==(int64_t)(t->array_len+1)){
+        t->array_len++;
+        while(1){int64_t nk=(int64_t)(t->array_len+1);uint32_t nh=(uint32_t)(nk*2654435761ULL);int ni=(int)(nh&mask),chk=0;
+            while(t->entries[ni].used&&chk<t->cap){
+                if(t->entries[ni].key.t==T_INT&&t->entries[ni].key.i==nk){t->array_len++;goto next_key;}
+                /* also check double keys */
+                if(t->entries[ni].key.t==T_DOUBLE){double d2=t->entries[ni].key.d;if(floor(d2)==d2&&(int64_t)d2==nk){t->array_len++;goto next_key;}}
+                ni=(ni+1)&mask;chk++;}
+            break;next_key:;}
+    }
+}
+static void table_set(Value tbl,Value key,Value val){if(tbl.t!=T_TABLE||!tbl.tbl){lua_runtime_error("attempt to index a %s value",(tbl.t==T_NIL?"nil":tbl.t==T_BOOL?"boolean":tbl.t==T_INT||tbl.t==T_DOUBLE?"number":tbl.t==T_FUNC?"function":"?"));free_value(tbl);free_value(key);free_value(val);return;}table_raw_set(tbl.tbl,key,val);free_value(tbl);}
+static Value table_get(Value tbl,Value key){
+    if(tbl.t!=T_TABLE||!tbl.tbl){lua_runtime_error("attempt to index a %s value",(tbl.t==T_NIL?"nil":tbl.t==T_BOOL?"boolean":tbl.t==T_INT||tbl.t==T_DOUBLE?"number":tbl.t==T_FUNC?"function":"?"));free_value(tbl);free_value(key);return(Value){.t=T_NIL};}
+    /* FIX-5: NaN is never equal to anything, so t[NaN] is always nil in Lua */
+    if(key.t==T_DOUBLE&&key.d!=key.d){free_value(tbl);free_value(key);return(Value){.t=T_NIL};}
+    Table*t=tbl.tbl;uint32_t h=hash_value(key);int mask=t->cap-1,idx=(int)(h&mask),chk=0;while(t->entries[idx].used&&chk<t->cap){if(keys_equal(t->entries[idx].key,key)){Value r=value_copy(t->entries[idx].val);free_value(tbl);free_value(key);return r;}idx=(idx+1)&mask;chk++;}free_value(tbl);free_value(key);return(Value){.t=T_NIL};}
 static Value table_call(Value tbl,Value key,int nargs,...);]]) end
 
 w([[
@@ -711,7 +1518,8 @@ static inline Value make_int(int64_t x){Value v;v.t=T_INT;v.i=x;return v;}
 static inline Value make_double(double x){Value v;v.t=T_DOUBLE;v.d=x;return v;}
 static inline Value make_bool(int b){Value v;v.t=T_BOOL;v.i=b?1:0;return v;}
 static inline Value make_nil(void){Value v;v.t=T_NIL;v.i=0;return v;}
-static Value make_string(const char*s){Value v;v.t=T_STRING;v.ls=s?luastr_new(s,strlen(s)):NULL;return v;}]])
+static Value make_string(const char*s){Value v;v.t=T_STRING;v.ls=s?luastr_new(s,strlen(s)):NULL;return v;}
+static Value make_string_n(const char*s,size_t n){Value v;v.t=T_STRING;v.ls=luastr_new(s,n);return v;}]])
 if has_tables then
     w("static Value make_table(void){Value v;v.t=T_TABLE;v.tbl=table_new();return v;}")
     w("static Value make_func(Value(*fn)(int,Value*)){Value v;v.t=T_FUNC;v.fn=fn;return v;}") end
@@ -727,69 +1535,529 @@ wif(has_tables,"    if(v.t==T_TABLE&&v.tbl){v.tbl->refcount++;return v;}")
 w("    return v;\n}")
 w("static int value_is_truthy(Value v){if(v.t==T_NIL)return 0;if(v.t==T_BOOL)return v.i!=0;return 1;}")
 
+wif(use.use_select or use.use_vararg,[[
+/* FIX-B6: use floor() for float index so negative indices work correctly */
+static Value lua_select_vararg(Value idx,int fixed,int nargs,Value*args){
+    if(idx.t==T_STRING&&idx.ls&&idx.ls->data[0]=='#'&&idx.ls->data[1]=='\0'){free_value(idx);return make_int(nargs-fixed);}
+    int64_t n=(idx.t==T_INT)?idx.i:(int64_t)floor(idx.d); free_value(idx);
+    if(n<0)n=(nargs-fixed)+n+1;
+    int pos=fixed+(int)n-1;
+    return(pos>=0&&pos<nargs)?value_copy(args[pos]):make_nil();
+}]])
+
+w([[
+/* All call helpers are self-contained: save caller's retbuf, run callee,
+ * restore + merge so caller sees callee's secondary returns in __retbuf[1..].
+ * No push/pop needed at call sites. */
+static Value value_call(Value fn,int nargs,...){
+    Value stack_args[16];
+    Value*args=NULL;
+    if(nargs>0){
+        if(nargs<=16)args=stack_args;
+        else{args=malloc(nargs*sizeof(Value));
+             if(!args){free_value(fn);lua_runtime_error("out of memory in value_call");LUA_UNREACHABLE();}}
+    }
+    va_list ap;va_start(ap,nargs);for(int i=0;i<nargs;i++)args[i]=va_arg(ap,Value);va_end(ap);
+    if(fn.t!=T_FUNC||!fn.fn){
+        for(int i=0;i<nargs;i++)free_value(args[i]);
+        if(nargs>16)free(args);
+        const char*tn=fn.t==T_NIL?"nil":fn.t==T_BOOL?"boolean":
+            fn.t==T_INT||fn.t==T_DOUBLE?"number":fn.t==T_STRING?"string":
+            fn.t==T_TABLE?"table":"?";
+        free_value(fn);
+        lua_runtime_error("attempt to call a %s value",tn);
+        LUA_UNREACHABLE();return make_nil();
+    }
+    retslot_save();
+    Value r=fn.fn(nargs,args);
+    retslot_restore();
+    free_value(fn);if(nargs>16)free(args);return r;
+}
+static Value value_call_splice(Value fn,int extra_count,Value*extra_args){
+    if(fn.t!=T_FUNC||!fn.fn){
+        for(int i=0;i<extra_count;i++)free_value(extra_args[i]);
+        const char*tn=fn.t==T_NIL?"nil":fn.t==T_BOOL?"boolean":
+            fn.t==T_INT||fn.t==T_DOUBLE?"number":fn.t==T_STRING?"string":
+            fn.t==T_TABLE?"table":"?";
+        free_value(fn);
+        lua_runtime_error("attempt to call a %s value",tn);
+        LUA_UNREACHABLE();return make_nil();
+    }
+    retslot_save();
+    Value r=fn.fn(extra_count,extra_args);
+    retslot_restore();
+    free_value(fn);return r;
+}]])
+
+wif(has_tables,[[
+static Value table_call(Value tbl,Value key,int nargs,...){
+    Value fn=table_get(value_copy(tbl),value_copy(key));free_value(tbl);free_value(key);
+    Value stack_args[16];
+    Value*args=NULL;
+    if(nargs>0){
+        if(nargs<=16)args=stack_args;
+        else{args=malloc(nargs*sizeof(Value));
+             if(!args){free_value(fn);lua_runtime_error("out of memory in table_call");LUA_UNREACHABLE();}}
+    }
+    va_list ap;va_start(ap,nargs);for(int i=0;i<nargs;i++)args[i]=va_arg(ap,Value);va_end(ap);
+    if(fn.t!=T_FUNC||!fn.fn){
+        for(int i=0;i<nargs;i++)free_value(args[i]);
+        if(nargs>16)free(args);
+        const char*tn=fn.t==T_NIL?"nil":fn.t==T_BOOL?"boolean":
+            fn.t==T_INT||fn.t==T_DOUBLE?"number":fn.t==T_STRING?"string":
+            fn.t==T_TABLE?"table":"?";
+        free_value(fn);
+        lua_runtime_error("attempt to call a %s value",tn);
+        LUA_UNREACHABLE();return make_nil();
+    }
+    retslot_save();
+    Value r=fn.fn(nargs,args);
+    retslot_restore();
+    free_value(fn);if(nargs>16)free(args);return r;
+}
+static Value table_call_splice(Value tbl,Value key,int extra_count,Value*extra_args){
+    Value fn=table_get(value_copy(tbl),value_copy(key));free_value(tbl);free_value(key);
+    if(fn.t!=T_FUNC||!fn.fn){
+        for(int i=0;i<extra_count;i++)free_value(extra_args[i]);
+        const char*tn=fn.t==T_NIL?"nil":fn.t==T_BOOL?"boolean":
+            fn.t==T_INT||fn.t==T_DOUBLE?"number":fn.t==T_STRING?"string":
+            fn.t==T_TABLE?"table":"?";
+        free_value(fn);
+        lua_runtime_error("attempt to call a %s value",tn);
+        LUA_UNREACHABLE();return make_nil();
+    }
+    retslot_save();
+    Value r=fn.fn(extra_count,extra_args);
+    retslot_restore();
+    free_value(fn);return r;
+}]])
+
+wif(use.method_call,[[
+static Value value_method_call(Value self,const char*method,int nargs,...){
+    Value fn=table_get(value_copy(self),make_string(method));
+    int total=nargs+1;
+    Value stack_args[17];
+    Value*args=total<=17?stack_args:malloc(total*sizeof(Value));
+    if(!args){free_value(self);free_value(fn);lua_runtime_error("out of memory in method_call");LUA_UNREACHABLE();}
+    args[0]=self;
+    va_list ap;va_start(ap,nargs);for(int i=0;i<nargs;i++)args[i+1]=va_arg(ap,Value);va_end(ap);
+    if(fn.t!=T_FUNC||!fn.fn){
+        for(int i=0;i<total;i++)free_value(args[i]);
+        if(total>17)free(args);
+        free_value(fn);
+        lua_runtime_error("attempt to call method '%s' (a %s value)",method,
+            fn.t==T_NIL?"nil":fn.t==T_TABLE?"table":"?");
+        LUA_UNREACHABLE();return make_nil();
+    }
+    retslot_save();
+    Value r=fn.fn(total,args);
+    retslot_restore();
+    free_value(fn);if(total>17)free(args);return r;
+}]])
+
+wif(use.use_tostring or use.print,[[
+static Value lua_tostring(Value v){
+    char buf[64];
+    switch(v.t){
+        case T_STRING:return v;
+        case T_INT:snprintf(buf,sizeof buf,"%lld",(long long)v.i);free_value(v);return make_string(buf);
+        case T_DOUBLE:snprintf(buf,sizeof buf,"%g",v.d);free_value(v);return make_string(buf);
+        case T_BOOL:{const char*s=v.i?"true":"false";free_value(v);return make_string(s);}
+        case T_NIL:free_value(v);return make_string("nil");
+        case T_TABLE:snprintf(buf,sizeof buf,"table:%p",(void*)v.tbl);free_value(v);return make_string(buf);
+        case T_FUNC:snprintf(buf,sizeof buf,"function:%p",(void*)(size_t)v.fn);free_value(v);return make_string(buf);
+        default:free_value(v);return make_string("?");
+    }
+}]])
+
+wif(use.use_tonumber,[[
+static Value lua_tonumber(Value v){
+    if(v.t==T_INT||v.t==T_DOUBLE)return v;
+    if(v.t==T_STRING&&v.ls){char*end;const char*s=v.ls->data;
+        long long iv=strtoll(s,&end,0);if(*end=='\0'){free_value(v);return make_int(iv);}
+        double dv=strtod(s,&end);if(*end=='\0'){free_value(v);return make_double(dv);}
+    }
+    free_value(v);return make_nil();
+}]])
+
+wif(use.use_type,[[
+static Value lua_type(Value v){
+    const char*s;
+    switch(v.t){case T_INT:case T_DOUBLE:s="number";break;case T_STRING:s="string";break;
+    case T_BOOL:s="boolean";break;case T_NIL:s="nil";break;case T_TABLE:s="table";break;
+    case T_FUNC:s="function";break;case T_FILE:s="file";break;default:s="userdata";}
+    free_value(v);return make_string(s);
+}]])
+
 wif(use.error or use.assert,[[
 static Value lua_error(Value msg){const char*m=(msg.t==T_STRING)?luastr_cstr(msg.ls):"(error object)";fprintf(stderr,"error: %s\n",m);free_value(msg);abort();return make_nil();}]])
 wif(use.assert,[[
 static Value lua_assert(Value cond,Value msg){if(!value_is_truthy(cond)){const char*m=(msg.t==T_STRING)?luastr_cstr(msg.ls):"assertion failed!";fprintf(stderr,"assertion failed: %s\n",m);free_value(cond);free_value(msg);abort();}free_value(msg);return cond;}]])
 wif(use.print,[[
-static void print_values(int n,Value*args){size_t cap=256;char*buf=malloc(cap);if(!buf)return;size_t len=0;for(int i=0;i<n;i++){if(i>0){if(len+1>=cap){cap*=2;buf=realloc(buf,cap);if(!buf)return;}buf[len++]='\t';}Value v=args[i];char tmp[64];const char*s=NULL;size_t slen=0;switch(v.t){case T_INT:slen=(size_t)snprintf(tmp,sizeof tmp,"%lld",(long long)v.i);s=tmp;break;case T_DOUBLE:slen=(size_t)snprintf(tmp,sizeof tmp,"%g",v.d);s=tmp;break;case T_STRING:s=luastr_cstr(v.ls);slen=strlen(s);break;case T_BOOL:s=v.i?"true":"false";slen=v.i?4u:5u;break;case T_NIL:s="nil";slen=3;break;case T_TABLE:slen=(size_t)snprintf(tmp,sizeof tmp,"table:%p",(void*)v.tbl);s=tmp;break;case T_FUNC:slen=(size_t)snprintf(tmp,sizeof tmp,"function:%p",(void*)(size_t)v.fn);s=tmp;break;case T_FILE:slen=(size_t)snprintf(tmp,sizeof tmp,"file:%p",(void*)v.file);s=tmp;break;default:s="";slen=0;break;}if(len+slen+1>=cap){while(len+slen+1>=cap)cap*=2;buf=realloc(buf,cap);if(!buf)return;}if(slen>0)memcpy(buf+len,s,slen);len+=slen;}if(len+1>=cap){cap=len+1;buf=realloc(buf,cap);if(!buf)return;}buf[len++]='\n';fwrite(buf,1,len,stdout);free(buf);for(int i=0;i<n;i++)free_value(args[i]);}]])
+static void print_values(int n,Value*args){
+    size_t cap=256;char*buf=malloc(cap);if(!buf)return;
+    size_t len=0;
+    for(int i=0;i<n;i++){
+        if(i>0){if(len+1>=cap){cap*=2;void*__rb=realloc(buf,cap);if(!__rb){free(buf);return;}buf=(char*)__rb;}buf[len++]='\t';}
+        Value v=args[i];char tmp[64];const char*s=NULL;size_t slen=0;
+        switch(v.t){case T_INT:slen=(size_t)snprintf(tmp,sizeof tmp,"%lld",(long long)v.i);s=tmp;break;case T_DOUBLE:slen=(size_t)snprintf(tmp,sizeof tmp,"%g",v.d);s=tmp;break;case T_STRING:s=luastr_cstr(v.ls);slen=strlen(s);break;case T_BOOL:s=v.i?"true":"false";slen=v.i?4u:5u;break;case T_NIL:s="nil";slen=3;break;case T_TABLE:slen=(size_t)snprintf(tmp,sizeof tmp,"table:%p",(void*)v.tbl);s=tmp;break;case T_FUNC:slen=(size_t)snprintf(tmp,sizeof tmp,"function:%p",(void*)(size_t)v.fn);s=tmp;break;case T_FILE:slen=(size_t)snprintf(tmp,sizeof tmp,"file:%p",(void*)v.file);s=tmp;break;default:s="";slen=0;break;}
+        if(len+slen+1>=cap){while(len+slen+1>=cap)cap*=2;void*__rb=realloc(buf,cap);if(!__rb){free(buf);return;}buf=(char*)__rb;}
+        if(slen>0)memcpy(buf+len,s,slen);len+=slen;}
+    if(len+1>=cap){cap=len+1;void*__rb=realloc(buf,cap);if(!__rb){free(buf);return;}buf=(char*)__rb;}
+    buf[len++]='\n';fwrite(buf,1,len,stdout);free(buf);
+    for(int i=0;i<n;i++)free_value(args[i]);}]])
 
-if has_tables then w([[
-static Value table_call(Value tbl,Value key,int nargs,...){Value fn=table_get(value_copy(tbl),value_copy(key));free_value(tbl);free_value(key);Value stack_args[8];Value*args=nargs>0?(nargs<=8?stack_args:malloc(nargs*sizeof(Value))):NULL;va_list ap;va_start(ap,nargs);for(int i=0;i<nargs;i++)args[i]=va_arg(ap,Value);va_end(ap);Value r;if(fn.t==T_FUNC&&fn.fn){r=fn.fn(nargs,args);}else{for(int i=0;i<nargs;i++)free_value(args[i]);r=make_nil();}free_value(fn);if(nargs>8&&args)free(args);return r;}]]) end
-wif(use.value_call,[[
-static Value value_call(Value fn,int nargs,...){Value stack_args[8];Value*args=nargs>0?(nargs<=8?stack_args:malloc(nargs*sizeof(Value))):NULL;va_list ap;va_start(ap,nargs);for(int i=0;i<nargs;i++)args[i]=va_arg(ap,Value);va_end(ap);Value r;if(fn.t==T_FUNC&&fn.fn){r=fn.fn(nargs,args);}else{for(int i=0;i<nargs;i++)free_value(args[i]);r=make_nil();}free_value(fn);if(nargs>8&&args)free(args);return r;}]])
--- FIX: value_method_call was malloc'ing args but never freeing the buffer on error path,
--- and always leaked the malloc'd array (used free(args) but only after fn call, not on
--- non-func path). Fixed: always free(args) at end, use stack buffer for small arg counts.
-wif(use.method_call,[[
-static Value value_method_call(Value self,const char*method,int nargs,...){Value key=make_string(method);Value fn=table_get(value_copy(self),key);int total=nargs+1;Value stack_args[9];Value*args=total<=9?stack_args:malloc(total*sizeof(Value));args[0]=self;va_list ap;va_start(ap,nargs);for(int i=0;i<nargs;i++)args[i+1]=va_arg(ap,Value);va_end(ap);Value r;if(fn.t==T_FUNC&&fn.fn){r=fn.fn(total,args);}else{for(int i=0;i<total;i++)free_value(args[i]);r=make_nil();}free_value(fn);if(total>9)free(args);return r;}]])
+-- Shared numeric type guard macro, and overflow-safe integer arithmetic (FIX-C2)
+w([[
+/* FIX-C2: Signed integer overflow is UB in C.  Lua 5.4 wraps on overflow
+ * (two's complement).  We cast through uint64_t for add/sub, and use
+ * __int128 on GCC/Clang for mul (exact wrap); portable fallback otherwise. */
+#define LUA_NUM_CHECK2(a,b) do{ \
+    if((a).t!=T_INT&&(a).t!=T_DOUBLE){lua_runtime_error("attempt to perform arithmetic on a %s value", \
+        (a).t==T_NIL?"nil":(a).t==T_STRING?"string":(a).t==T_BOOL?"boolean":"?");free_value(a);free_value(b);return make_nil();} \
+    if((b).t!=T_INT&&(b).t!=T_DOUBLE){lua_runtime_error("attempt to perform arithmetic on a %s value", \
+        (b).t==T_NIL?"nil":(b).t==T_STRING?"string":(b).t==T_BOOL?"boolean":"?");free_value(a);free_value(b);return make_nil();} \
+}while(0)
+#define I64_ADD(a,b) ((int64_t)((uint64_t)(a)+(uint64_t)(b)))
+#define I64_SUB(a,b) ((int64_t)((uint64_t)(a)-(uint64_t)(b)))
+#if defined(__GNUC__)||defined(__clang__)
+#  define I64_MUL(a,b) ((int64_t)((__int128)(a)*(__int128)(b)))
+#else
+#  define I64_MUL(a,b) ((int64_t)((uint64_t)(a)*(uint64_t)(b)))
+#endif
+]])
 
 w("\n/* Operator helpers */")
-wif(use.value_len,"static Value value_len(Value v){Value r;if(v.t==T_STRING)r=make_int(v.ls?(int64_t)strlen(v.ls->data):0);else if(v.t==T_TABLE&&v.tbl)r=make_int(v.tbl->len);else r=make_int(0);free_value(v);return r;}")
--- FIX: value_concat - guard against NULL as/bs to avoid writing nothing but still allocating
+wif(use.value_len,[[static Value value_len(Value v){
+    if(v.t==T_STRING){int64_t l=v.ls?(int64_t)strlen(v.ls->data):0;free_value(v);return make_int(l);}
+    if(v.t==T_TABLE&&v.tbl){int64_t l=(int64_t)v.tbl->array_len;free_value(v);return make_int(l);}
+    lua_runtime_error("attempt to get length of a %s value",
+        v.t==T_NIL?"nil":v.t==T_BOOL?"boolean":v.t==T_INT||v.t==T_DOUBLE?"number":
+        v.t==T_FUNC?"function":"?");
+    free_value(v);return make_int(0);}]])
 wif(use.value_concat,[[
-static Value value_concat(Value a,Value b){char abuf[64],bbuf[64];const char*as=NULL;const char*bs=NULL;if(a.t==T_STRING)as=luastr_cstr(a.ls);else if(a.t==T_INT){snprintf(abuf,sizeof abuf,"%lld",(long long)a.i);as=abuf;}else if(a.t==T_DOUBLE){snprintf(abuf,sizeof abuf,"%g",a.d);as=abuf;}if(b.t==T_STRING)bs=luastr_cstr(b.ls);else if(b.t==T_INT){snprintf(bbuf,sizeof bbuf,"%lld",(long long)b.i);bs=bbuf;}else if(b.t==T_DOUBLE){snprintf(bbuf,sizeof bbuf,"%g",b.d);bs=bbuf;}size_t la=as?strlen(as):0,lb=bs?strlen(bs):0;LuaStr*ls=luastr_new(NULL,la+lb);if(la>0&&as)memcpy(ls->data,as,la);if(lb>0&&bs)memcpy(ls->data+la,bs,lb);free_value(a);free_value(b);Value r;r.t=T_STRING;r.ls=ls;return r;}]])
-wif(use.numval,"static double numval(Value v){return v.t==T_DOUBLE?v.d:(double)v.i;}")
-wif(use.value_add,"static Value value_add(Value a,Value b){Value r=(a.t==T_INT&&b.t==T_INT)?make_int(a.i+b.i):make_double(numval(a)+numval(b));free_value(a);free_value(b);return r;}")
-wif(use.value_sub,"static Value value_sub(Value a,Value b){Value r=(a.t==T_INT&&b.t==T_INT)?make_int(a.i-b.i):make_double(numval(a)-numval(b));free_value(a);free_value(b);return r;}")
-wif(use.value_mul,"static Value value_mul(Value a,Value b){Value r=(a.t==T_INT&&b.t==T_INT)?make_int(a.i*b.i):make_double(numval(a)*numval(b));free_value(a);free_value(b);return r;}")
-wif(use.value_div,"static Value value_div(Value a,Value b){double r=numval(a)/numval(b);free_value(a);free_value(b);return make_double(r);}")
-wif(use.value_mod,"static Value value_mod(Value a,Value b){Value r;double da=numval(a),db=numval(b);if(a.t==T_INT&&b.t==T_INT&&b.i!=0)r=make_int(((a.i%b.i)+b.i)%b.i);else r=make_double(da-floor(da/db)*db);free_value(a);free_value(b);return r;}")
+static Value value_concat(Value a,Value b){
+    char abuf[64],bbuf[64];const char*as=NULL;const char*bs=NULL;
+    if(a.t==T_STRING)as=luastr_cstr(a.ls);
+    else if(a.t==T_INT){snprintf(abuf,sizeof abuf,"%lld",(long long)a.i);as=abuf;}
+    else if(a.t==T_DOUBLE){snprintf(abuf,sizeof abuf,"%g",a.d);as=abuf;}
+    else{lua_runtime_error("attempt to concatenate a %s value",
+            a.t==T_NIL?"nil":a.t==T_BOOL?"boolean":a.t==T_TABLE?"table":
+            a.t==T_FUNC?"function":"?");free_value(a);free_value(b);return make_string("");}
+    if(b.t==T_STRING)bs=luastr_cstr(b.ls);
+    else if(b.t==T_INT){snprintf(bbuf,sizeof bbuf,"%lld",(long long)b.i);bs=bbuf;}
+    else if(b.t==T_DOUBLE){snprintf(bbuf,sizeof bbuf,"%g",b.d);bs=bbuf;}
+    else{lua_runtime_error("attempt to concatenate a %s value",
+            b.t==T_NIL?"nil":b.t==T_BOOL?"boolean":b.t==T_TABLE?"table":
+            b.t==T_FUNC?"function":"?");free_value(a);free_value(b);return make_string("");}
+    size_t la=as?strlen(as):0,lb=bs?strlen(bs):0;
+    LuaStr*ls=luastr_new(NULL,la+lb);
+    if(la>0&&as)memcpy(ls->data,as,la);
+    if(lb>0&&bs)memcpy(ls->data+la,bs,lb);
+    free_value(a);free_value(b);Value r;r.t=T_STRING;r.ls=ls;return r;}]])
+w("static double numval(Value v){return v.t==T_DOUBLE?v.d:(double)v.i;}")
+wif(use.value_add,[[static Value value_add(Value a,Value b){
+    LUA_NUM_CHECK2(a,b);
+    Value r=(a.t==T_INT&&b.t==T_INT)?make_int(I64_ADD(a.i,b.i)):make_double(numval(a)+numval(b));free_value(a);free_value(b);return r;}]])
+wif(use.value_sub,[[static Value value_sub(Value a,Value b){
+    LUA_NUM_CHECK2(a,b);
+    Value r=(a.t==T_INT&&b.t==T_INT)?make_int(I64_SUB(a.i,b.i)):make_double(numval(a)-numval(b));free_value(a);free_value(b);return r;}]])
+wif(use.value_mul,[[static Value value_mul(Value a,Value b){
+    LUA_NUM_CHECK2(a,b);
+    Value r=(a.t==T_INT&&b.t==T_INT)?make_int(I64_MUL(a.i,b.i)):make_double(numval(a)*numval(b));free_value(a);free_value(b);return r;}]])
+wif(use.value_div,[[static Value value_div(Value a,Value b){
+    LUA_NUM_CHECK2(a,b);  /* FIX-B3: type-check before any numval access */
+    if(a.t==T_INT&&b.t==T_INT){
+        if(b.i==0){free_value(a);free_value(b);lua_runtime_error("attempt to divide by zero");}
+        double r=(double)a.i/(double)b.i;free_value(a);free_value(b);return make_double(r);}
+    double r=numval(a)/numval(b);free_value(a);free_value(b);return make_double(r);}]])
+wif(use.value_mod,[[static Value value_mod(Value a,Value b){
+    LUA_NUM_CHECK2(a,b);  /* FIX-B3: type-check covers float branch too */
+    if(a.t==T_INT&&b.t==T_INT){
+        if(b.i==0){free_value(a);free_value(b);lua_runtime_error("attempt to perform 'n%%0'");}
+        int64_t r=((a.i%b.i)+b.i)%b.i;free_value(a);free_value(b);return make_int(r);}
+    double da=numval(a),db=numval(b);free_value(a);free_value(b);
+    if(db==0.0)return make_double(0.0/0.0);
+    return make_double(da-floor(da/db)*db);}]])
+wif(use.value_pow,[[static Value value_pow(Value a,Value b){
+    LUA_NUM_CHECK2(a,b);  /* FIX-B4: type-check before pow() */
+    double r=pow(numval(a),numval(b));free_value(a);free_value(b);return make_double(r);}]])
 wif(use.value_eq,"static Value value_eq(Value a,Value b){int eq;if(a.t==T_NIL&&b.t==T_NIL)eq=1;else if(a.t==T_NIL||b.t==T_NIL)eq=0;else if(a.t==b.t){if(a.t==T_INT)eq=(a.i==b.i);else if(a.t==T_DOUBLE)eq=(a.d==b.d);else if(a.t==T_STRING)eq=(a.ls==b.ls||strcmp(luastr_cstr(a.ls),luastr_cstr(b.ls))==0);else if(a.t==T_BOOL)eq=(a.i==b.i);else if(a.t==T_TABLE)eq=(a.tbl==b.tbl);else eq=0;}else if((a.t==T_INT||a.t==T_DOUBLE)&&(b.t==T_INT||b.t==T_DOUBLE))eq=(numval(a)==numval(b));else eq=0;free_value(a);free_value(b);return make_bool(eq);}")
 wif(use.value_neq,"static Value value_neq(Value a,Value b){Value r=value_eq(a,b);int v=!value_is_truthy(r);free_value(r);return make_bool(v);}")
-wif(use.value_lt,"static Value value_lt(Value a,Value b){int lt;if((a.t==T_INT||a.t==T_DOUBLE)&&(b.t==T_INT||b.t==T_DOUBLE))lt=(numval(a)<numval(b));else if(a.t==T_STRING&&b.t==T_STRING)lt=(strcmp(luastr_cstr(a.ls),luastr_cstr(b.ls))<0);else lt=0;free_value(a);free_value(b);return make_bool(lt);}")
+w([[
+#define LUA_TYPENAME(v) ((v).t==T_NIL?"nil":(v).t==T_BOOL?"boolean":\
+    (v).t==T_INT||(v).t==T_DOUBLE?"number":(v).t==T_STRING?"string":\
+    (v).t==T_TABLE?"table":(v).t==T_FUNC?"function":"?")
+]])
+wif(use.value_lt,[[static Value value_lt(Value a,Value b){
+    if((a.t==T_INT||a.t==T_DOUBLE)&&(b.t==T_INT||b.t==T_DOUBLE)){int r=(numval(a)<numval(b));free_value(a);free_value(b);return make_bool(r);}
+    if(a.t==T_STRING&&b.t==T_STRING){int r=(strcmp(luastr_cstr(a.ls),luastr_cstr(b.ls))<0);free_value(a);free_value(b);return make_bool(r);}
+    lua_runtime_error("attempt to compare %s with %s",LUA_TYPENAME(a),LUA_TYPENAME(b));
+    free_value(a);free_value(b);return make_bool(0);}]])
 wif(use.value_gt,"static Value value_gt(Value a,Value b){return value_lt(b,a);}")
--- FIX: value_le - old version made a2/b2 copies then passed originals to value_lt which freed them,
--- then if not lt, called value_eq(a2,b2) which freed the copies. That is correct but convoluted.
--- Simpler and cleaner: use value_lt then value_eq on fresh copies, no manual copy juggling.
-wif(use.value_le,[[
-static Value value_le(Value a,Value b){int lt;if((a.t==T_INT||a.t==T_DOUBLE)&&(b.t==T_INT||b.t==T_DOUBLE))lt=(numval(a)<=numval(b));else if(a.t==T_STRING&&b.t==T_STRING)lt=(strcmp(luastr_cstr(a.ls),luastr_cstr(b.ls))<=0);else lt=0;free_value(a);free_value(b);return make_bool(lt);}]])
-wif(use.value_ge,[[
-static Value value_ge(Value a,Value b){int ge;if((a.t==T_INT||a.t==T_DOUBLE)&&(b.t==T_INT||b.t==T_DOUBLE))ge=(numval(a)>=numval(b));else if(a.t==T_STRING&&b.t==T_STRING)ge=(strcmp(luastr_cstr(a.ls),luastr_cstr(b.ls))>=0);else ge=0;free_value(a);free_value(b);return make_bool(ge);}]])
--- FIX: value_and/value_or - old version freed both args but returned a plain bool, which is wrong
--- for Lua semantics (Lua 'and'/'or' return one of the operands, not a bool). However since we
--- eagerly evaluate both sides before calling, we can't truly short-circuit. We fix the semantics:
--- 'and' returns the first falsy value, or the last value if all truthy.
--- 'or'  returns the first truthy value, or the last value if all falsy.
--- This also eliminates the leak where the returned operand was being freed before return.
-wif(use.value_and,[[
-static Value value_and(Value a,Value b){if(!value_is_truthy(a)){free_value(b);return a;}free_value(a);return b;}]])
-wif(use.value_or,[[
-static Value value_or(Value a,Value b){if(value_is_truthy(a)){free_value(b);return a;}free_value(a);return b;}]])
+wif(use.value_le,[[static Value value_le(Value a,Value b){
+    if((a.t==T_INT||a.t==T_DOUBLE)&&(b.t==T_INT||b.t==T_DOUBLE)){int r=(numval(a)<=numval(b));free_value(a);free_value(b);return make_bool(r);}
+    if(a.t==T_STRING&&b.t==T_STRING){int r=(strcmp(luastr_cstr(a.ls),luastr_cstr(b.ls))<=0);free_value(a);free_value(b);return make_bool(r);}
+    lua_runtime_error("attempt to compare %s with %s",LUA_TYPENAME(a),LUA_TYPENAME(b));
+    free_value(a);free_value(b);return make_bool(0);}]])
+wif(use.value_ge,[[static Value value_ge(Value a,Value b){
+    if((a.t==T_INT||a.t==T_DOUBLE)&&(b.t==T_INT||b.t==T_DOUBLE)){int r=(numval(a)>=numval(b));free_value(a);free_value(b);return make_bool(r);}
+    if(a.t==T_STRING&&b.t==T_STRING){int r=(strcmp(luastr_cstr(a.ls),luastr_cstr(b.ls))>=0);free_value(a);free_value(b);return make_bool(r);}
+    lua_runtime_error("attempt to compare %s with %s",LUA_TYPENAME(a),LUA_TYPENAME(b));
+    free_value(a);free_value(b);return make_bool(0);}]])
+wif(use.value_and,"static Value value_and(Value a,Value b){if(!value_is_truthy(a)){free_value(b);return a;}free_value(a);return b;}")
+wif(use.value_or,"static Value value_or(Value a,Value b){if(value_is_truthy(a)){free_value(b);return a;}free_value(a);return b;}")
 wif(use.value_not,"static Value value_not(Value a){int r=!value_is_truthy(a);free_value(a);return make_bool(r);}")
+
+-- ---------------------------------------------------------------------------
+-- String library
+-- ---------------------------------------------------------------------------
+if use.string_lib then
+w([==[
+typedef struct{
+    const char*src_init,*src_end,*p_end;
+    struct{const char*init;ptrdiff_t len;}capture[32];
+    int level;
+}MatchState;
+#define CAP_UNFINISHED (-1)
+#define CAP_POSITION   (-2)
+#define L_ESC '%'
+
+static int matchclass(int c,int cl){int res,lc=tolower(cl);switch(lc){case 'a':res=isalpha(c);break;case 'c':res=iscntrl(c);break;case 'd':res=isdigit(c);break;case 'g':res=isgraph(c);break;case 'l':res=islower(c);break;case 'p':res=ispunct(c);break;case 's':res=isspace(c);break;case 'u':res=isupper(c);break;case 'w':res=isalnum(c);break;case 'x':res=isxdigit(c);break;default:return cl==c;}return(islower(cl)?res:!res);}
+static int singlematch(MatchState*ms,const char*s,const char*p){if(s>=ms->src_end)return 0;unsigned char c=(unsigned char)*s;switch(*p){case '.':return 1;case L_ESC:return matchclass(c,(unsigned char)*(p+1));case '[':return 0;default:return((unsigned char)*p==c);}}
+static const char*match(MatchState*ms,const char*s,const char*p);
+static const char*matchbalance(MatchState*ms,const char*s,const char*p){if(p>=ms->p_end-1)return NULL;if(*s!=*p)return NULL;int b=*p,e=*(p+1),cont=1;while(++s<ms->src_end){if(*s==e){if(--cont==0)return s+1;}else if(*s==b)cont++;}return NULL;}
+static const char*max_expand(MatchState*ms,const char*s,const char*p,const char*ep){int i=0;while(singlematch(ms,s+i,p))i++;while(i>=0){const char*res=match(ms,s+i,ep);if(res)return res;i--;}return NULL;}
+static const char*min_expand(MatchState*ms,const char*s,const char*p,const char*ep){for(;;){const char*res=match(ms,s,ep);if(res)return res;if(singlematch(ms,s,p))s++;else return NULL;}}
+static int matchbracketclass(int c,const char*p,const char*ec){int sig=1;if(*(p+1)=='^'){sig=0;p++;}while(++p<ec){if(*p==L_ESC){p++;if(matchclass(c,(unsigned char)*p))return sig;}else if((*(p+1)=='-')&&(p+2<ec)){p+=2;if((unsigned char)*(p-2)<=(unsigned char)c&&c<=(unsigned char)*p)return sig;}else if((unsigned char)*p==c)return sig;}return !sig;}
+static const char*classend(const char*p){switch(*p++){case'\0':return p-1;case L_ESC:return(*p=='\0'?p:p+1);case'[':{if(*p=='^')p++;do{if(*p=='\0')return p;if(*p++==L_ESC&&*p!='\0')p++;}while(*p!=']');return p+1;}default:return p;}}
+static const char*match(MatchState*ms,const char*s,const char*p){
+    if(p>=ms->p_end)return s;
+    switch(*p){
+        case'(':{const char*res;int l=ms->level;if(*(p+1)==')'){ms->capture[l].init=s;ms->capture[l].len=CAP_POSITION;ms->level=l+1;res=match(ms,s,p+2);if(!res)ms->level=l;}else{ms->capture[l].init=s;ms->capture[l].len=CAP_UNFINISHED;ms->level=l+1;res=match(ms,s,p+1);if(!res)ms->level=l;}return res;}
+        case')':{int l=ms->level-1;while(l>=0&&ms->capture[l].len!=CAP_UNFINISHED)l--;if(l<0)return NULL;ms->capture[l].len=(ptrdiff_t)(s-ms->capture[l].init);const char*res=match(ms,s,p+1);if(!res)ms->capture[l].len=CAP_UNFINISHED;return res;}
+        case'$':if(*(p+1)=='\0')return(s==ms->src_end?s:NULL);
+        default:{const char*ep=classend(p);int m;if(*p=='[')m=matchbracketclass((unsigned char)*s,p,ep-1)&&s<ms->src_end;else m=singlematch(ms,s,p);switch(*ep){case'?':{const char*res;if(m&&(res=match(ms,s+1,ep+1)))return res;return match(ms,s,ep+1);}case'+':{return m?max_expand(ms,s+1,p,ep+1):NULL;}case'*':{return max_expand(ms,s,p,ep+1);}case'-':{return min_expand(ms,s,p,ep+1);}default:{if(!m)return NULL;s++;p=ep;return match(ms,s,p);}}}
+        case'%':{switch(*(p+1)){case'b':{s=matchbalance(ms,s,p+2);if(!s)return NULL;p+=4;return match(ms,s,p);}default:{const char*ep=classend(p);int m;if(*p=='[')m=matchbracketclass((unsigned char)*s,p,ep-1)&&s<ms->src_end;else m=singlematch(ms,s,p);switch(*ep){case'?':{const char*res;if(m&&(res=match(ms,s+1,ep+1)))return res;return match(ms,s,ep+1);}case'+':{return m?max_expand(ms,s+1,p,ep+1):NULL;}case'*':{return max_expand(ms,s,p,ep+1);}case'-':{return min_expand(ms,s,p,ep+1);}default:{if(!m)return NULL;return match(ms,s+1,ep);}}}}}
+    }
+}
+static int push_captures(MatchState*ms,const char*s,const char*e,int off){
+    int nlevels=(ms->level==0&&s)?1:ms->level,count=0;
+    for(int i=0;i<nlevels;i++){if(i+off>=__retbuf_cap)break;
+        if(ms->level==0)__retbuf[off+i]=make_string_n(s,(size_t)(e-s));
+        else if(ms->capture[i].len==CAP_POSITION)__retbuf[off+i]=make_int(ms->capture[i].init-ms->src_init+1);
+        else __retbuf[off+i]=make_string_n(ms->capture[i].init,(size_t)ms->capture[i].len);
+        count++;}
+    return count;
+}
+
+#define STR_FREE_RET(n,a,ret) do{for(int _i=0;_i<(n);_i++)free_value((a)[_i]);return(ret);}while(0)
+#define BA(c) do{if(buflen+1>=bufsz){bufsz*=2;void*__r=realloc(buf,bufsz);if(!__r){free(buf);buf=NULL;}else buf=(char*)__r;}if(buf)buf[buflen++]=(c);}while(0)
+#define BAS(str,l2) do{size_t _l=(l2);while(buflen+_l+1>=bufsz){bufsz*=2;void*__r=realloc(buf,bufsz);if(!__r){free(buf);buf=NULL;break;}buf=(char*)__r;}if(buf){memcpy(buf+buflen,(str),_l);buflen+=_l;}}while(0)
+
+static Value lua_string_len(int n,Value*a){if(n<1||a[0].t!=T_STRING)STR_FREE_RET(n,a,make_int(0));int64_t l=a[0].ls?(int64_t)strlen(a[0].ls->data):0;STR_FREE_RET(n,a,make_int(l));}
+static Value lua_string_sub(int n,Value*a){
+    if(n<1||a[0].t!=T_STRING)STR_FREE_RET(n,a,make_string(""));
+    const char*s=luastr_cstr(a[0].ls);int64_t sl=(int64_t)strlen(s);
+    int64_t i=n>1?(int64_t)numval(a[1]):1,j=n>2?(int64_t)numval(a[2]):sl;
+    if(i<0)i=sl+i+1;if(j<0)j=sl+j+1;if(i<1)i=1;if(j>sl)j=sl;
+    Value r=(i>j)?make_string(""):make_string_n(s+(i-1),(size_t)(j-i+1));
+    STR_FREE_RET(n,a,r);
+}
+static Value lua_string_rep(int n,Value*a){
+    if(n<2||a[0].t!=T_STRING)STR_FREE_RET(n,a,make_string(""));
+    const char*s=luastr_cstr(a[0].ls);size_t sl=strlen(s);int64_t cnt=(int64_t)numval(a[1]);
+    const char*sep=(n>2&&a[2].t==T_STRING)?luastr_cstr(a[2].ls):"";size_t sepl=strlen(sep);
+    if(cnt<=0)STR_FREE_RET(n,a,make_string(""));
+    size_t total=sl*cnt+sepl*(cnt>1?cnt-1:0);
+    char*buf=(char*)malloc(total+1);
+    if(!buf)STR_FREE_RET(n,a,make_string(""));
+    size_t pos=0;
+    for(int64_t k=0;k<cnt;k++){if(k>0&&sepl){memcpy(buf+pos,sep,sepl);pos+=sepl;}memcpy(buf+pos,s,sl);pos+=sl;}
+    buf[total]='\0';Value r=make_string(buf);free(buf);STR_FREE_RET(n,a,r);
+}
+static Value lua_string_reverse(int n,Value*a){
+    if(n<1||a[0].t!=T_STRING)STR_FREE_RET(n,a,make_string(""));
+    const char*s=luastr_cstr(a[0].ls);size_t sl=strlen(s);char*buf=malloc(sl+1);
+    if(!buf)STR_FREE_RET(n,a,make_string(""));
+    for(size_t k=0;k<sl;k++)buf[k]=s[sl-1-k];buf[sl]='\0';
+    Value r=make_string(buf);free(buf);STR_FREE_RET(n,a,r);
+}
+static Value lua_string_upper(int n,Value*a){
+    if(n<1||a[0].t!=T_STRING)STR_FREE_RET(n,a,make_string(""));
+    const char*s=luastr_cstr(a[0].ls);size_t sl=strlen(s);char*buf=malloc(sl+1);
+    if(!buf)STR_FREE_RET(n,a,make_string(""));
+    for(size_t k=0;k<sl;k++)buf[k]=(char)toupper((unsigned char)s[k]);buf[sl]='\0';
+    Value r=make_string(buf);free(buf);STR_FREE_RET(n,a,r);
+}
+static Value lua_string_lower(int n,Value*a){
+    if(n<1||a[0].t!=T_STRING)STR_FREE_RET(n,a,make_string(""));
+    const char*s=luastr_cstr(a[0].ls);size_t sl=strlen(s);char*buf=malloc(sl+1);
+    if(!buf)STR_FREE_RET(n,a,make_string(""));
+    for(size_t k=0;k<sl;k++)buf[k]=(char)tolower((unsigned char)s[k]);buf[sl]='\0';
+    Value r=make_string(buf);free(buf);STR_FREE_RET(n,a,r);
+}
+static Value lua_string_byte(int n,Value*a){
+    if(n<1||a[0].t!=T_STRING)STR_FREE_RET(n,a,make_nil());
+    const char*s=luastr_cstr(a[0].ls);int64_t sl=(int64_t)strlen(s);
+    int64_t i=n>1?(int64_t)numval(a[1]):1,j=n>2?(int64_t)numval(a[2]):i;
+    if(i<0)i=sl+i+1;if(j<0)j=sl+j+1;if(i<1)i=1;if(j>sl)j=sl;
+    for(int k=0;k<n;k++)free_value(a[k]);
+    if(i>j)return make_nil();
+    int64_t cnt=j-i+1;
+    for(int ri=1;ri<__retncount&&ri<__retbuf_cap;ri++)free_value(__retbuf[ri]);
+    __retncount=(int)cnt;
+    for(int64_t k=0;k<cnt;k++)if(k<__retbuf_cap)__retbuf[k]=make_int((unsigned char)s[i-1+k]);
+    return make_int((unsigned char)s[i-1]);
+}
+static Value lua_string_char(int n,Value*a){
+    char*buf=malloc(n+1);
+    if(!buf){for(int i=0;i<n;i++)free_value(a[i]);return make_string("");}
+    for(int i=0;i<n;i++){buf[i]=(char)(int64_t)numval(a[i]);free_value(a[i]);}
+    buf[n]='\0';Value r=make_string(buf);free(buf);return r;
+}
+static Value lua_string_find(int n,Value*a){
+    if(n<2||a[0].t!=T_STRING||a[1].t!=T_STRING)STR_FREE_RET(n,a,make_nil());
+    const char*s=luastr_cstr(a[0].ls);size_t sl=strlen(s);
+    const char*p=luastr_cstr(a[1].ls);
+    int64_t init=n>2?(int64_t)numval(a[2]):1;int plain=n>3&&value_is_truthy(a[3]);
+    if(init<0)init=(int64_t)sl+init+1;if(init<1)init=1;if(init>(int64_t)sl+1)init=(int64_t)sl+1;
+    const char*s1=s+init-1;
+    for(int i=0;i<n;i++)free_value(a[i]);
+    if(plain){const char*found=strstr(s1,p);if(!found)return make_nil();
+        int64_t st=(int64_t)(found-s)+1,en=st+(int64_t)strlen(p)-1;
+        for(int ri=1;ri<__retncount&&ri<__retbuf_cap;ri++)free_value(__retbuf[ri]);
+        __retncount=2;__retbuf[0]=make_int(st);__retbuf[1]=make_int(en);return make_int(st);}
+    MatchState ms;ms.src_init=s;ms.src_end=s+sl;ms.p_end=p+strlen(p);
+    int anchor=0;if(*p=='^'){anchor=1;p++;}
+    const char*s2=s1;
+    do{ms.level=0;const char*res=match(&ms,s2,p);
+        if(res){int64_t st=(int64_t)(s2-s)+1,en=(int64_t)(res-s);
+            for(int ri=1;ri<__retncount&&ri<__retbuf_cap;ri++)free_value(__retbuf[ri]);
+            __retncount=2;__retbuf[0]=make_int(st);__retbuf[1]=make_int(en);return make_int(st);}
+    }while(s2++<ms.src_end&&!anchor);
+    return make_nil();
+}
+static Value lua_string_match(int n,Value*a){
+    if(n<2||a[0].t!=T_STRING||a[1].t!=T_STRING)STR_FREE_RET(n,a,make_nil());
+    const char*s=luastr_cstr(a[0].ls);size_t sl=strlen(s);const char*p=luastr_cstr(a[1].ls);
+    int64_t init=n>2?(int64_t)numval(a[2]):1;
+    if(init<0)init=(int64_t)sl+init+1;if(init<1)init=1;if(init>(int64_t)sl+1)init=(int64_t)sl+1;
+    const char*s1=s+init-1;
+    for(int i=0;i<n;i++)free_value(a[i]);
+    MatchState ms;ms.src_init=s;ms.src_end=s+sl;int anchor=0;
+    if(*p=='^'){anchor=1;p++;}ms.p_end=p+strlen(p);
+    const char*s2=s1;
+    do{ms.level=0;const char*res=match(&ms,s2,p);
+        if(res){for(int ri=0;ri<__retncount&&ri<__retbuf_cap;ri++)free_value(__retbuf[ri]);
+            int nc=push_captures(&ms,s2,res,0);__retncount=nc;
+            return nc>0?value_copy(__retbuf[0]):make_nil();}
+    }while(s2++<ms.src_end&&!anchor);
+    return make_nil();
+}
+static Value lua_string_gmatch(int n,Value*a){
+    if(n<2||a[0].t!=T_STRING||a[1].t!=T_STRING)STR_FREE_RET(n,a,make_nil());
+    const char*s=luastr_cstr(a[0].ls);size_t sl=strlen(s);const char*p=luastr_cstr(a[1].ls);
+    for(int i=0;i<n;i++)free_value(a[i]);
+    Value tbl=make_table();int idx=1;
+    MatchState ms;ms.src_init=s;ms.src_end=s+sl;ms.p_end=p+strlen(p);
+    const char*src=s;
+    while(src<=ms.src_end){
+        ms.level=0;const char*e=match(&ms,src,p);
+        if(e){
+            if(ms.level>1){Value sub=make_table();for(int ci=0;ci<ms.level;ci++){Value cap;if(ms.capture[ci].len==CAP_POSITION)cap=make_int(ms.capture[ci].init-ms.src_init+1);else cap=make_string_n(ms.capture[ci].init,(size_t)ms.capture[ci].len);table_raw_set(sub.tbl,make_int(ci+1),cap);}table_raw_set(tbl.tbl,make_int(idx++),sub);}
+            else if(ms.level==1){Value cap;if(ms.capture[0].len==CAP_POSITION)cap=make_int(ms.capture[0].init-ms.src_init+1);else cap=make_string_n(ms.capture[0].init,(size_t)ms.capture[0].len);table_raw_set(tbl.tbl,make_int(idx++),cap);}
+            else{table_raw_set(tbl.tbl,make_int(idx++),make_string_n(src,(size_t)(e-src)));}
+            if(e==src)src++;else src=e;
+        }else src++;
+    }
+    return tbl;
+}
+static Value lua_string_gsub(int n,Value*a){
+    if(n<3||a[0].t!=T_STRING||a[1].t!=T_STRING)STR_FREE_RET(n,a,make_string(""));
+    const char*s=luastr_cstr(a[0].ls);size_t sl=strlen(s);const char*p=luastr_cstr(a[1].ls);
+    int maxn=n>3?(int)numval(a[3]):-1;
+    size_t bufsz=sl*2+64;char*buf=malloc(bufsz);size_t buflen=0;int count=0;
+    if(!buf)STR_FREE_RET(n,a,make_string(""));
+    MatchState ms;ms.src_init=s;ms.src_end=s+sl;ms.p_end=p+strlen(p);
+    int anchor=(*p=='^');if(anchor)p++;ms.p_end=p+strlen(p);
+    const char*src=s;
+    while((maxn<0||count<maxn)&&src<=ms.src_end){
+        ms.level=0;const char*e=match(&ms,src,p);
+        if(e){count++;
+            if(a[2].t==T_STRING){const char*repl=luastr_cstr(a[2].ls);while(*repl){if(*repl!='%'){BA(*repl++);}else{repl++;if(*repl>='0'&&*repl<='9'){int ci=*repl-'0';repl++;if(ci==0){BAS(src,(size_t)(e-src));}else if(ci<=ms.level&&ms.capture[ci-1].len>=0)BAS(ms.capture[ci-1].init,(size_t)ms.capture[ci-1].len);}else{BA(*repl++);}}}}
+            else if(a[2].t==T_TABLE){Value key=ms.level>0&&ms.capture[0].len>=0?make_string_n(ms.capture[0].init,(size_t)ms.capture[0].len):make_string_n(src,(size_t)(e-src));Value val=table_get(value_copy(a[2]),key);if(value_is_truthy(val)){Value sv=lua_tostring(value_copy(val));BAS(luastr_cstr(sv.ls),strlen(luastr_cstr(sv.ls)));free_value(sv);}else{BAS(src,(size_t)(e-src));}free_value(val);}
+            else if(a[2].t==T_FUNC){Value fargs[32];int nf=0;if(ms.level>0){for(int ci=0;ci<ms.level&&nf<32;ci++){if(ms.capture[ci].len==CAP_POSITION)fargs[nf++]=make_int(ms.capture[ci].init-ms.src_init+1);else fargs[nf++]=make_string_n(ms.capture[ci].init,(size_t)ms.capture[ci].len);}}else{fargs[nf++]=make_string_n(src,(size_t)(e-src));}Value rv=a[2].fn(nf,fargs);if(value_is_truthy(rv)){Value sv=lua_tostring(value_copy(rv));BAS(luastr_cstr(sv.ls),strlen(luastr_cstr(sv.ls)));free_value(sv);}else{BAS(src,(size_t)(e-src));}free_value(rv);}
+            if(e==src)BA(*src++);else src=e;
+        }else{BA(*src++);}
+        if(anchor)break;
+    }
+    if(buf){while(src<ms.src_end)BA(*src++);buf[buflen]='\0';}
+    int64_t cnt_val=count;
+    for(int i=0;i<n;i++)free_value(a[i]);
+    for(int ri=1;ri<__retncount&&ri<__retbuf_cap;ri++)free_value(__retbuf[ri]);
+    __retncount=2;
+    Value res_str=buf?make_string(buf):make_string("");
+    free(buf);
+    __retbuf[0]=res_str;__retbuf[1]=make_int(cnt_val);
+    return value_copy(__retbuf[0]);
+}
+static Value lua_string_format(int n,Value*a){
+    if(n<1||a[0].t!=T_STRING)STR_FREE_RET(n,a,make_string(""));
+    const char*fmt=luastr_cstr(a[0].ls);size_t bufsz=256;char*buf=malloc(bufsz);
+    if(!buf)STR_FREE_RET(n,a,make_string(""));
+    size_t buflen=0;int argi=1;
+    while(*fmt){
+        if(*fmt!='%'){BA(*fmt++);continue;}fmt++;if(*fmt=='%'){BA('%');fmt++;continue;}
+        char spec[64];int si=0;spec[si++]='%';
+        while(*fmt&&strchr("-+ #0",*fmt))spec[si++]=*fmt++;
+        while(*fmt&&isdigit(*fmt))spec[si++]=*fmt++;
+        if(*fmt=='.'){spec[si++]=*fmt++;while(*fmt&&isdigit(*fmt))spec[si++]=*fmt++;}
+        char conv=*fmt++;
+        switch(conv){case'd':case'i':case'u':case'o':case'x':case'X':spec[si++]='l';spec[si++]='l';spec[si++]=conv;spec[si]='\0';break;default:spec[si++]=conv;spec[si]='\0';}
+        char tmp[256];Value av=argi<n?value_copy(a[argi]):make_nil();argi++;
+        switch(conv){
+            case'd':case'i':snprintf(tmp,sizeof tmp,spec,(long long)(av.t==T_INT?av.i:(int64_t)av.d));BAS(tmp,strlen(tmp));break;
+            case'u':snprintf(tmp,sizeof tmp,spec,(unsigned long long)(av.t==T_INT?(uint64_t)av.i:(uint64_t)(int64_t)av.d));BAS(tmp,strlen(tmp));break;
+            case'o':case'x':case'X':snprintf(tmp,sizeof tmp,spec,(unsigned long long)(av.t==T_INT?(uint64_t)av.i:(uint64_t)(int64_t)av.d));BAS(tmp,strlen(tmp));break;
+            case'f':case'e':case'E':case'g':case'G':snprintf(tmp,sizeof tmp,spec,numval(av));BAS(tmp,strlen(tmp));break;
+            case'c':BA((char)(av.t==T_INT?av.i:(int64_t)av.d));break;
+            case's':{const char*sv;char sb[64];if(av.t==T_STRING)sv=luastr_cstr(av.ls);else if(av.t==T_INT){snprintf(sb,sizeof sb,"%lld",(long long)av.i);sv=sb;}else if(av.t==T_DOUBLE){snprintf(sb,sizeof sb,"%g",av.d);sv=sb;}else sv="nil";snprintf(tmp,sizeof tmp,spec,sv);BAS(tmp,strlen(tmp));break;}
+            case'q':{BA('"');const char*sv;if(av.t==T_STRING)sv=luastr_cstr(av.ls);else{char qb[64];if(av.t==T_INT)snprintf(qb,sizeof qb,"%lld",(long long)av.i);else if(av.t==T_DOUBLE)snprintf(qb,sizeof qb,"%g",av.d);else snprintf(qb,sizeof qb,"nil");sv=qb;}while(*sv){if(*sv=='"'||*sv=='\\'||*sv=='\n'){BA('\\');}BA(*sv++);}BA('"');break;}
+            default:BA(conv);break;
+        }
+        free_value(av);
+    }
+    if(buf)buf[buflen]='\0';
+    for(int i=0;i<n;i++)free_value(a[i]);
+    Value r=buf?make_string(buf):make_string("");free(buf);return r;
+}
+#undef STR_FREE_RET
+#undef BA
+#undef BAS
+static Value make_string_table(void){
+    Value t=make_table();
+    #define SS(name) table_raw_set(t.tbl,make_string(#name),make_func(lua_string_##name))
+    SS(len);SS(sub);SS(rep);SS(reverse);SS(upper);SS(lower);SS(byte);SS(char);
+    SS(find);SS(match);SS(gmatch);SS(gsub);SS(format);
+    #undef SS
+    return t;
+}
+]==])
+end
 
 -- Math library
 if use.math_lib then
     w("\n/* math */")
     wif(use.prng,"static uint64_t prng_state=0;")
-    w("#define M1(name,expr) static Value lua_math_##name(int n,Value*a){double x=numval(a[0]);free_value(a[0]);return make_double(expr);}");
+    w("#define M1(name,expr) static Value lua_math_##name(int n,Value*a){double x=numval(a[0]);free_value(a[0]);return make_double(expr);}")
     w("#define M2(name,expr) static Value lua_math_##name(int n,Value*a){double x=numval(a[0]),y=numval(a[1]);free_value(a[0]);free_value(a[1]);return make_double(expr);}")
     local m1={abs="fabs(x)",floor="floor(x)",ceil="ceil(x)",sqrt="sqrt(x)",sin="sin(x)",cos="cos(x)",tan="tan(x)",
         asin="asin(x)",acos="acos(x)",atan="atan(x)",exp="exp(x)",log="log(x)",log10="log10(x)",
         sinh="sinh(x)",cosh="cosh(x)",tanh="tanh(x)",deg="x*(180.0/3.14159265358979323846)",rad="x*(3.14159265358979323846/180.0)"}
     local m2={atan2="atan2(x,y)",pow="pow(x,y)",fmod="fmod(x,y)"}
     for _,fn in ipairs(math_fns) do if used_math[fn] then
-        if m1[fn] then w(("M1(%s,%s)"):format(fn,m1[fn]))
+        if     m1[fn] then w(("M1(%s,%s)"):format(fn,m1[fn]))
         elseif m2[fn] then w(("M2(%s,%s)"):format(fn,m2[fn]))
         elseif fn=="max" then w("static Value lua_math_max(int n,Value*a){double r=numval(a[0]);free_value(a[0]);for(int i=1;i<n;i++){double v=numval(a[i]);free_value(a[i]);if(v>r)r=v;}return make_double(r);}")
         elseif fn=="min" then w("static Value lua_math_min(int n,Value*a){double r=numval(a[0]);free_value(a[0]);for(int i=1;i<n;i++){double v=numval(a[i]);free_value(a[i]);if(v<r)r=v;}return make_double(r);}")
@@ -837,15 +2105,12 @@ end
 -- IO library
 if use.io_lib then
     w("\n/* io */")
-    -- shared read-line helper macro
-    w("#define READ_LINE(F,DEST,FAIL_EXPR) do{size_t cap=256,len=0;char*buf=malloc(cap);int c;while((c=fgetc(F))!=EOF&&c!='\\n'){if(len+1>=cap){cap*=2;buf=realloc(buf,cap);}buf[len++]=(char)c;}if(c==EOF&&len==0){free(buf);FAIL_EXPR;}buf[len]='\\0';DEST=make_string(buf);free(buf);}while(0)")
-    w("#define READ_ALL(F,DEST) do{size_t cap=256,len=0;char*buf=malloc(cap);int c;while((c=fgetc(F))!=EOF){if(len+1>=cap){cap*=2;buf=realloc(buf,cap);}buf[len++]=(char)c;}buf[len]='\\0';DEST=make_string(buf);free(buf);}while(0)")
+    w("#define READ_LINE(F,DEST,FAIL_EXPR) do{size_t cap=256,len=0;char*buf=malloc(cap);int c;while((c=fgetc(F))!=EOF&&c!='\\n'){if(len+1>=cap){cap*=2;void*__rb=realloc(buf,cap);if(!__rb){free(buf);FAIL_EXPR;}buf=(char*)__rb;}buf[len++]=(char)c;}if(c==EOF&&len==0){free(buf);FAIL_EXPR;}buf[len]='\\0';DEST=make_string(buf);free(buf);}while(0)")
+    w("#define READ_ALL(F,DEST) do{size_t cap=256,len=0;char*buf=malloc(cap);int c;while((c=fgetc(F))!=EOF){if(len+1>=cap){cap*=2;void*__rb=realloc(buf,cap);if(!__rb){free(buf);DEST=make_string(\"\");break;}buf=(char*)__rb;}buf[len++]=(char)c;}buf[len]='\\0';DEST=make_string(buf);free(buf);}while(0)")
     w("#define IS_NUM_FMT(f) (strcmp(f,\"*n\")==0||strcmp(f,\"n\")==0||strcmp(f,\"*number\")==0||strcmp(f,\"number\")==0)")
     w("#define IS_ALL_FMT(f) (strcmp(f,\"*a\")==0||strcmp(f,\"a\")==0)")
-
     wif(used_io.write,[[static Value lua_io_write(int n,Value*a){for(int i=0;i<n;i++){switch(a[i].t){case T_STRING:fwrite(luastr_cstr(a[i].ls),1,strlen(luastr_cstr(a[i].ls)),stdout);break;case T_INT:fprintf(stdout,"%lld",(long long)a[i].i);break;case T_DOUBLE:fprintf(stdout,"%g",a[i].d);break;default:break;}free_value(a[i]);}fflush(stdout);return make_nil();}]])
     wif(used_io.read,[[static Value lua_io_read(int n,Value*a){const char*fmt="*l";if(n>0&&a[0].t==T_STRING&&a[0].ls)fmt=luastr_cstr(a[0].ls);Value r;if(IS_NUM_FMT(fmt)){double d;r=(scanf("%lf",&d)==1)?make_double(d):make_nil();}else if(IS_ALL_FMT(fmt)){READ_ALL(stdin,r);}else{READ_LINE(stdin,r,{if(n>0)free_value(a[0]);return make_nil();});}if(n>0)free_value(a[0]);return r;}]])
-
     if used_io.open then w([[
 static Value lua_file_read(int n,Value*a);
 static Value lua_file_write(int n,Value*a);
@@ -858,7 +2123,6 @@ static Value lua_file_read(int n,Value*a){if(n<1)return make_nil();FILE*f=file_h
 static Value lua_file_write(int n,Value*a){if(n<1)return make_nil();FILE*f=file_handle_get(a[0]);if(!f){for(int i=0;i<n;i++)free_value(a[i]);return make_nil();}for(int i=1;i<n;i++){switch(a[i].t){case T_STRING:fwrite(luastr_cstr(a[i].ls),1,strlen(luastr_cstr(a[i].ls)),f);break;case T_INT:fprintf(f,"%lld",(long long)a[i].i);break;case T_DOUBLE:fprintf(f,"%g",a[i].d);break;default:break;}}for(int i=0;i<n;i++)free_value(a[i]);return make_nil();}
 static Value lua_file_close(int n,Value*a){if(n>0){FILE*f=file_handle_get(a[0]);if(f&&f!=stdout&&f!=stderr&&f!=stdin)fclose(f);for(int i=0;i<n;i++)free_value(a[i]);}return make_nil();}
 static Value lua_file_lines(int n,Value*a){if(n<1)return make_nil();FILE*f=file_handle_get(a[0]);if(!f){for(int i=0;i<n;i++)free_value(a[i]);return make_nil();}Value tbl=make_table();int idx=1;while(1){Value line;READ_LINE(f,line,break);table_raw_set(tbl.tbl,make_int(idx++),line);}for(int i=0;i<n;i++)free_value(a[i]);return tbl;}]]) end
-
     wif(used_io.close,"static Value lua_io_close(int n,Value*a){if(n>0){FILE*f=file_handle_get(a[0]);if(f&&f!=stdout&&f!=stderr&&f!=stdin)fclose(f);for(int i=0;i<n;i++)free_value(a[i]);}return make_nil();}")
     wif(used_io.flush,"static Value lua_io_flush(int n,Value*a){fflush(stdout);for(int i=0;i<n;i++)free_value(a[i]);return make_nil();}")
     wif(used_io.lines,[[static Value lua_io_lines(int n,Value*a){FILE*f=stdin;int opened=0;if(n>0&&a[0].t==T_STRING&&a[0].ls){f=fopen(luastr_cstr(a[0].ls),"r");opened=1;}for(int i=0;i<n;i++)free_value(a[i]);if(!f)return make_nil();Value tbl=make_table();int idx=1;while(1){Value line;READ_LINE(f,line,break);table_raw_set(tbl.tbl,make_int(idx++),line);}if(opened)fclose(f);return tbl;}]])
@@ -875,84 +2139,102 @@ end
 
 -- Globals
 w("\n/* globals */")
-for name,_ in pairs(globals) do w("static Value "..name..";") end
+for name in pairs(globals) do w("static Value "..name..";") end
 wif(use.math_lib,"static Value math;")
-wif(use.os_lib,"static Value os;")
-wif(use.io_lib,"static Value io;")
+wif(use.os_lib,  "static Value os;")
+wif(use.io_lib,  "static Value io;")
+wif(use.string_lib,"static Value string;")
+w("static Value arg;")
 w("")
 
 -- User-defined functions
 for _,fn in ipairs(functions) do
-    local fname=fn.name; local args=trim(fn.args)
-    local local_vars={}
-    local tp,mn=fname:match("^(.+)__([^_].*)$")
-    if not tp then tp,mn=fname:match("^(.+)__(_+.*)$") end
-    if tp and mn then
-        w(("static Value %s(int __nargs,Value*__args){"):format(fname))
-        local ai=0
-        for a in (args..","):gmatch("(.-),") do a=trim(a); if #a>0 then
-            w(("    Value %s=__nargs>%d?value_copy(__args[%d]):make_nil();"):format(a,ai,ai))
-            local_vars[a]=true; ai=ai+1 end end
-    else
-        local arglist={}
-        for a in (args..","):gmatch("(.-),") do a=trim(a); if #a>0 then
-            table.insert(arglist,"Value "..a); local_vars[a]=true end end
-        w(("Value %s(%s){"):format(fname,table.concat(arglist,",")))
+    local fname = fn.name
+    local args_str = trim(fn.args)
+    local fixed_args = {}; local is_vararg = false
+    if args_str ~= "" then
+        for a in (args_str..","):gmatch("(.-),") do
+            a = trim(a)
+            if a == "..." then is_vararg = true
+            elseif #a > 0 then table.insert(fixed_args, a) end
+        end
     end
-    local ctx={local_vars=local_vars,assigned={},globals_tbl=globals}
-    local bi=1
-    while bi<=#fn.body do local stmt,consumed=gen_stmt(fn.body,bi,ctx);w(stmt);bi=bi+consumed end
-    -- Only free locals that weren't freed by a return statement
-    -- (emit_scope_cleanup handles locals on return paths; here we handle fall-through)
-    for v,_ in pairs(local_vars) do w(("    free_value(%s);"):format(v)) end
+
+    local local_vars = {}
+    w(("static Value %s(int __nargs,Value*__args){"):format(fname))
+    for ai,a in ipairs(fixed_args) do
+        w(("    Value %s=__nargs>%d?value_copy(__args[%d]):make_nil();"):format(a,ai-1,ai-1))
+        local_vars[a] = true
+    end
+
+    local prev_fixed = current_fn_fixed_argc
+    current_fn_fixed_argc = #fixed_args
+
+    local ctx = {local_vars=local_vars, assigned={}, globals_tbl=globals}
+    local bi = 1
+    while bi <= #fn.body do local stmt,consumed = gen_stmt(fn.body,bi,ctx); w(stmt); bi=bi+consumed end
+    if not ctx.returned then
+        for v in pairs(local_vars) do w(("    free_value(%s);"):format(v)) end
+    end
     w("    return make_nil();\n}\n")
+
+    current_fn_fixed_argc = prev_fixed
 end
 
 -- main()
-w("int main(void){")
-for name,_ in pairs(globals) do w("    "..name.."=make_nil();") end
-wif(use.math_lib,"    math=make_math_table();")
-wif(use.os_lib,"    os=make_os_table();")
-wif(use.io_lib,"    io=make_io_table();")
+w("int main(int argc,char**argv){")
+for name in pairs(globals) do w("    "..name.."=make_nil();") end
+wif(use.math_lib,  "    math=make_math_table();")
+wif(use.os_lib,    "    os=make_os_table();")
+wif(use.io_lib,    "    io=make_io_table();")
+wif(use.string_lib,"    string=make_string_table();")
+w([[
+    arg=make_table();
+    for(int __ai=1;__ai<argc;__ai++){
+        table_raw_set(arg.tbl,make_int(__ai),make_string(argv[__ai]));
+    }
+]])
 
-local method_registry={}
+local method_registry = {}
 for _,fn in ipairs(functions) do
-    local tp,mn=fn.name:match("^(.+)__([^_].*)$")
-    if not tp then tp,mn=fn.name:match("^(.+)__(_+.*)$") end
+    local tp,mn = fn.name:match("^(.+)__([^_].*)$")
+    if not tp then tp,mn = fn.name:match("^(.+)__(_+.*)$") end
     if tp and mn then
         if not method_registry[tp] then method_registry[tp]={} end
-        table.insert(method_registry[tp],{meth=mn,fname=fn.name})
+        table.insert(method_registry[tp], {meth=mn, fname=fn.name})
     end
 end
 w("")
 
-local assigned_map={}; local ti=1
-local ctx_top={local_vars=nil,assigned=assigned_map,globals_tbl=globals}
-while ti<=#topstmts do
-    local stmt,consumed=gen_stmt(topstmts,ti,ctx_top); w(stmt)
-    local av=trim(topstmts[ti]or""):match("^([A-Za-z_][A-Za-z0-9_]*)%s*=")
+local assigned_map = {}; local ti = 1
+current_fn_fixed_argc = 0
+local ctx_top = {local_vars=nil, assigned=assigned_map, globals_tbl=globals}
+while ti <= #topstmts do
+    local stmt,consumed = gen_stmt(topstmts, ti, ctx_top); w(stmt)
+    local av = trim(topstmts[ti] or ""):match("^local%s+([A-Za-z_][A-Za-z0-9_]*)%s*=")
+           or  trim(topstmts[ti] or ""):match("^([A-Za-z_][A-Za-z0-9_]*)%s*=")
     if av and method_registry[av] then
         for _,m in ipairs(method_registry[av]) do
             w(('    table_raw_set(%s.tbl,make_string("%s"),make_func(%s));'):format(av,m.meth,m.fname)) end
-        method_registry[av]=nil
+        method_registry[av] = nil
     end
-    ti=ti+consumed
+    ti = ti+consumed
 end
 for tbl_name,methods in pairs(method_registry) do
     for _,m in ipairs(methods) do
         w(('    table_raw_set(%s.tbl,make_string("%s"),make_func(%s));'):format(tbl_name,m.meth,m.fname)) end
 end
 
-w("\n    /* cleanup */")
-for name,_ in pairs(globals) do w("    free_value("..name..");") end
-wif(use.math_lib,"    free_value(math);")
-wif(use.os_lib,"    free_value(os);")
-wif(use.io_lib,"    free_value(io);")
+w("\n    /* cleanup globals */")
+for name in pairs(globals) do w("    free_value("..name..");") end
+wif(use.math_lib,  "    free_value(math);")
+wif(use.os_lib,    "    free_value(os);")
+wif(use.io_lib,    "    free_value(io);")
+wif(use.string_lib,"    free_value(string);")
+w("    free_value(arg);")
 w("    return 0;\n}")
 
-local f=assert(io.open(output_path,"w"))
+local f = assert(io.open(output_path,"w"))
 f:write(table.concat(out,"\n"))
 f:close()
 print("Wrote "..output_path)
-
-
